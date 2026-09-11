@@ -1,0 +1,60 @@
+use ntex::web;
+
+use skw_lib_shared::{
+    APP,
+    prelude::{consts::*, iggy::*, log::*},
+};
+
+mod cfg;
+mod crypto;
+mod structs;
+mod tls;
+mod ws;
+
+use cfg::*;
+use ws::*;
+
+use mimalloc::MiMalloc;
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
+#[ntex::main]
+async fn main() -> anyhow::Result<()> {
+    let bind_addr = APP.config.expect_string(SERVICE_BIND_ADDRESS);
+
+    let workers = APP
+        .config
+        .get(SERVICE_WORKERS)
+        .map(|w| w.as_u64().expect("workers is not a number") as usize)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(2, std::num::NonZeroUsize::get));
+
+    // force config validation (fail-fast) and initialization at startup
+    // rather than lazily on the first websocket auth/heartbeat
+    info!("using auth service url: {}", CFG_AUTH_SERVICE_URL.as_str());
+    info!(
+        "heartbeat interval: {:?}, client timeout: {:?}",
+        *CFG_HEARTBEAT_INTERVAL, *CFG_CLIENT_TIMEOUT
+    );
+
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("unable to install rustls aws-lc-rs CryptoProvider");
+
+    let tls_config = tls::build_rustls_config()?;
+
+    info!("starting skw-ws-gate listening on https://{}", bind_addr);
+
+    web::server(async || {
+        web::App::new()
+            // enable logger
+            .middleware(web::middleware::Logger::default())
+            // websocket route
+            .service(web::resource("/ws/").route(web::get().to(ws_index)))
+    })
+    .bind_rustls(&bind_addr, &tls_config)?
+    .workers(workers)
+    .run()
+    .await?;
+
+    Ok(())
+}

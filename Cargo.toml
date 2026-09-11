@@ -1,0 +1,23 @@
+[package]
+name = "ws"
+version = { workspace = true }
+edition = { workspace = true }
+authors = ["Sergey Kutsenko <sergey.wild.man@gmail.com>"]
+
+[[bin]]
+name = "ws"
+path = "src/main.rs"
+
+[dependencies]
+skw-lib-shared = { workspace = true }
+skw-lib-http-protos = { workspace = true }
+ed25519-dalek = { workspace = true }
+mimalloc = "0.1.52"
+ntex = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }

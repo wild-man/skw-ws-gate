@@ -1,19 +1,26 @@
 use std::{cell::RefCell, rc::Rc, time::Instant};
 
-use futures::future::{Either, select};
 use ntex::service::{Service, fn_factory_with_config, fn_shutdown};
 use ntex::util::Bytes;
 use ntex::web;
 use ntex::{chain, fn_service};
 use ntex::{channel::oneshot, rt, time};
 
+use tokio::sync::mpsc::UnboundedSender;
+
 use crate::cfg::{CFG_CLIENT_TIMEOUT, CFG_HEARTBEAT_INTERVAL};
 use crate::crypto::{check_authorize, verify_signature};
+use crate::gate::{ConnectionEntry, PendingRequestEntry, WsGateState, WsOutbound, publish_to_service};
 use crate::structs::{AuthState, WsMethod, WsRequest, WsState};
-use skw_lib_shared::prelude::log::*;
+use skw_lib_shared::prelude::{chrono::Utc, consts::BACK_MESSAGE_TIMEOUT, log::*, uuid::Uuid};
 
 /// handler for a single incoming websocket frame
-pub(crate) async fn handle_frame(state: Rc<RefCell<WsState>>, frame: web::ws::Frame) -> Result<Option<web::ws::Message>, anyhow::Error> {
+pub(crate) async fn handle_frame(
+    state: Rc<RefCell<WsState>>,
+    gate_state: WsGateState,
+    outbound_tx: UnboundedSender<WsOutbound>,
+    frame: web::ws::Frame,
+) -> Result<Option<web::ws::Message>, anyhow::Error> {
     let item = match frame {
         // update heartbeat (only once authorized)
         web::ws::Frame::Ping(msg) => {
@@ -48,10 +55,24 @@ pub(crate) async fn handle_frame(state: Rc<RefCell<WsState>>, frame: web::ws::Fr
                         match serde_json::from_value::<WsMethod>(req.data.method.clone()) {
                             Ok(WsMethod::Authorize { api_key }) => match check_authorize(api_key, &req.signature, req.data.raw_str()).await {
                                 Ok(public_key) => {
-                                    let mut state = state.borrow_mut();
-                                    state.auth = AuthState::Authorized;
-                                    state.hb = Instant::now();
-                                    state.public_key = Some(public_key);
+                                    let connection_id = {
+                                        let mut state = state.borrow_mut();
+                                        state.auth = AuthState::Authorized;
+                                        state.hb = Instant::now();
+                                        state.public_key = Some(public_key);
+                                        state.api_key = Some(api_key);
+                                        state.connection_id
+                                    };
+
+                                    // now that identity is known, this connection becomes
+                                    // targetable — register it in the gate's connections
+                                    // registry (deregistered on shutdown, see ws_service)
+                                    gate_state.connections.insert(
+                                        connection_id,
+                                        ConnectionEntry {
+                                            outbound: outbound_tx.clone(),
+                                        },
+                                    );
 
                                     //@todo replace to Payload struct like in api gate
                                     let reply = serde_json::json!({ "authorized": true }).to_string();
@@ -66,18 +87,19 @@ pub(crate) async fn handle_frame(state: Rc<RefCell<WsState>>, frame: web::ws::Fr
                     }
                     AuthState::Authorized => {
                         // set together with AuthState::Authorized, so always present here
-                        let public_key = state
-                            .borrow()
-                            .public_key
-                            .clone()
-                            .expect("public_key set once Authorized");
+                        let (public_key, api_key) = {
+                            let state = state.borrow();
+                            (
+                                state
+                                    .public_key
+                                    .clone()
+                                    .expect("public_key set once Authorized"),
+                                state.api_key,
+                            )
+                        };
 
                         match verify_signature(&public_key, &req.signature, req.data.raw_str()) {
-                            Ok(()) => {
-                                info!("received: {req:?}");
-                                let reply = serde_json::to_string(&req).expect("serialize WsRequest");
-                                Some(web::ws::Message::Text(reply.into()))
-                            }
+                            Ok(()) => dispatch_request(&gate_state, &outbound_tx, api_key, req).await,
                             Err(_) => unauthorized_close(),
                         }
                     }
@@ -104,27 +126,123 @@ pub(crate) async fn handle_frame(state: Rc<RefCell<WsState>>, frame: web::ws::Fr
     Ok(item)
 }
 
+/// Resolves the target service from `req.uri`, registers a pending-request
+/// entry keyed by `req.signature`, spawns a timeout watchdog, and publishes
+/// the request to the resolved service topic. Returns `None` immediately
+/// without waiting for a reply — the frame-processing service stays free to
+/// handle the next frame (heartbeats, other requests) on this connection
+/// while the reply is delivered later, asynchronously, via the shared
+/// back-topic consumer loop -> outbound channel -> heartbeat task -> sink.
+async fn dispatch_request(
+    gate_state: &WsGateState,
+    outbound_tx: &UnboundedSender<WsOutbound>,
+    api_key: Option<Uuid>,
+    req: WsRequest,
+) -> Option<web::ws::Message> {
+    let Some(uri) = req.uri.as_deref().filter(|u| !u.is_empty()) else {
+        return error_message(&req.signature, "missing or empty uri");
+    };
+
+    let Some(slug1) = uri
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .filter(|s| !s.is_empty())
+    else {
+        return error_message(&req.signature, "invalid uri");
+    };
+
+    let Some(producer) = gate_state.routes_map.map.get(slug1).cloned() else {
+        return error_message(&req.signature, "unknown service");
+    };
+
+    gate_state.pending_requests.insert(
+        req.signature.clone(),
+        PendingRequestEntry {
+            outbound: outbound_tx.clone(),
+            uri: uri.to_string(),
+            ts_gate_published: Utc::now(),
+        },
+    );
+
+    // timeout watchdog: if the back-topic consumer loop never removes this
+    // entry (no reply arrived in time), remove it ourselves and notify the
+    // client — mirrors gates/api's 30s BACK_MESSAGE_TIMEOUT / 504 behavior
+    let pending_requests = gate_state.pending_requests.clone();
+    let sig_for_timeout = req.signature.clone();
+    let uri_for_timeout = uri.to_string();
+    tokio::spawn(async move {
+        tokio::time::sleep(BACK_MESSAGE_TIMEOUT).await;
+        if let Some((signature, entry)) = pending_requests.remove(&sig_for_timeout) {
+            warn!(
+                "timeout waiting for backend response signature: {}",
+                signature
+            );
+            let _ = entry.outbound.send(WsOutbound::Timeout {
+                signature,
+                uri: uri_for_timeout,
+            });
+        }
+    });
+
+    if let Err(e) = publish_to_service(
+        producer,
+        api_key.as_ref(),
+        &req.signature,
+        uri,
+        req.data.raw_str().as_bytes(),
+    )
+    .await
+    {
+        error!("publish to service error: {}", e);
+        gate_state.pending_requests.remove(&req.signature);
+        return error_message(&req.signature, "internal error");
+    }
+
+    None
+}
+
 /// WebSockets service factory
 pub(crate) async fn ws_service(
     sink: web::ws::WsSink,
+    gate_state: WsGateState,
 ) -> Result<impl Service<web::ws::Frame, Response = Option<web::ws::Message>, Error = anyhow::Error>, web::Error> {
+    let connection_id = Uuid::now_v7();
+
     let state = Rc::new(RefCell::new(WsState {
         hb: Instant::now(),
         auth: AuthState::Pending,
         public_key: None,
+        api_key: None,
+        connection_id,
     }));
+
+    // outbound channel: the only Send-safe handle to this connection reachable
+    // from other tasks (WsSink itself is !Send, thread-affine to this
+    // connection's worker thread — see heartbeat below, the sole owner of `sink`)
+    let (outbound_tx, outbound_rx) = tokio::sync::mpsc::unbounded_channel::<WsOutbound>();
 
     // disconnect notification
     let (tx, rx) = oneshot::channel();
 
-    // start heartbeat task
-    rt::spawn(heartbeat(state.clone(), sink, rx));
+    // start heartbeat + outbound-delivery task
+    rt::spawn(heartbeat(state.clone(), sink, rx, outbound_rx));
 
     // handler service for incoming websockets frames
-    let service = fn_service(move |frame| handle_frame(state.clone(), frame));
+    let gate_state_frames = gate_state.clone();
+    let service = fn_service(move |frame| {
+        handle_frame(
+            state.clone(),
+            gate_state_frames.clone(),
+            outbound_tx.clone(),
+            frame,
+        )
+    });
 
-    // handler service for shutdown notification that stop heartbeat task
+    // handler service for shutdown notification: stops the heartbeat task and
+    // deregisters this connection from the gate's connections registry
     let on_shutdown = fn_shutdown(async move || {
+        gate_state.connections.remove(&connection_id);
         let _ = tx.send(());
     });
 
@@ -132,11 +250,22 @@ pub(crate) async fn ws_service(
     Ok(chain(service).and_then(on_shutdown))
 }
 
-/// helper method that sends ping to client every heartbeat interval
-pub(crate) async fn heartbeat(state: Rc<RefCell<WsState>>, sink: web::ws::WsSink, mut rx: oneshot::Receiver<()>) {
+/// sends ping to client every heartbeat interval, and is the sole task
+/// allowed to call `sink.send(...)` for this connection — both for
+/// heartbeat pings and for backend-originated replies/pushes/timeouts
+/// arriving on `outbound_rx` from the shared back-topic consumer loop or a
+/// request's timeout watchdog (both of which run on the tokio (`Send`)
+/// runtime and cannot touch `WsSink` directly, since it wraps an `Rc` and is
+/// `!Send`/`!Sync`, thread-affine to this connection's worker thread).
+pub(crate) async fn heartbeat(
+    state: Rc<RefCell<WsState>>,
+    sink: web::ws::WsSink,
+    mut rx: oneshot::Receiver<()>,
+    mut outbound_rx: tokio::sync::mpsc::UnboundedReceiver<WsOutbound>,
+) {
     loop {
-        match select(Box::pin(time::sleep(*CFG_HEARTBEAT_INTERVAL)), &mut rx).await {
-            Either::Left(_) => {
+        tokio::select! {
+            _ = time::sleep(*CFG_HEARTBEAT_INTERVAL) => {
                 // check client heartbeats
                 if Instant::now().duration_since(state.borrow().hb) > *CFG_CLIENT_TIMEOUT {
                     // heartbeat timed out
@@ -146,25 +275,65 @@ pub(crate) async fn heartbeat(state: Rc<RefCell<WsState>>, sink: web::ws::WsSink
                 }
 
                 // send ping
-                if sink
-                    .send(web::ws::Message::Ping(Bytes::default()))
-                    .await
-                    .is_err()
-                {
+                if sink.send(web::ws::Message::Ping(Bytes::default())).await.is_err() {
                     return;
                 }
             }
-            Either::Right(_) => {
+            _ = &mut rx => {
                 warn!("Connection is dropped, stop heartbeat task");
                 return;
+            }
+            msg = outbound_rx.recv() => {
+                let Some(msg) = msg else {
+                    // all senders dropped; connection teardown handled by the other branches
+                    continue;
+                };
+                if sink.send(build_ws_message(msg)).await.is_err() {
+                    return;
+                }
             }
         }
     }
 }
 
+//@todo replace to Payload struct like in api gate
+fn build_ws_message(outbound: WsOutbound) -> web::ws::Message {
+    let json = match outbound {
+        WsOutbound::Reply {
+            signature,
+            payload,
+            service_error,
+        } => {
+            let payload: serde_json::Value = serde_json::from_slice(&payload).unwrap_or(serde_json::Value::Null);
+            serde_json::json!({
+                "Signature": signature,
+                "Error": service_error.map(|e| e.to_string()),
+                "Payload": payload,
+            })
+        }
+        WsOutbound::Push { payload } => {
+            let payload: serde_json::Value = serde_json::from_slice(&payload).unwrap_or(serde_json::Value::Null);
+            serde_json::json!({ "Push": true, "Payload": payload })
+        }
+        WsOutbound::Timeout { signature, uri } => {
+            serde_json::json!({ "Signature": signature, "Error": "Timeout", "Uri": uri })
+        }
+    };
+    web::ws::Message::Text(json.to_string().into())
+}
+
 /// do websocket handshake and start web sockets service
-pub(crate) async fn ws_index(req: web::HttpRequest) -> Result<web::HttpResponse, web::Error> {
-    web::ws::start(req, None::<String>, fn_factory_with_config(ws_service)).await
+pub(crate) async fn ws_index(req: web::HttpRequest, state: web::types::State<WsGateState>) -> Result<web::HttpResponse, web::Error> {
+    let gate_state = state.get_ref().clone();
+    web::ws::start(
+        req,
+        None::<String>,
+        fn_factory_with_config(move |sink| {
+            let gate_state = gate_state.clone();
+            async move { ws_service(sink, gate_state).await }
+        }),
+    )
+    .await
 }
 
 // connection is not authorized until the client's first message
@@ -174,4 +343,14 @@ pub(crate) fn unauthorized_close() -> Option<web::ws::Message> {
         code: web::ws::CloseCode::Policy,
         description: Some("unauthorized".into()), // @todo move to some Payload struct
     })))
+}
+
+// non-terminal error reply for a signed-but-unroutable/unpublishable
+// request; the connection stays open for further requests.
+fn error_message(signature: &str, reason: &str) -> Option<web::ws::Message> {
+    Some(web::ws::Message::Text(
+        serde_json::json!({ "signature": signature, "error": reason })
+            .to_string()
+            .into(),
+    ))
 }

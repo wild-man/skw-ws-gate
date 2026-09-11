@@ -2,11 +2,12 @@ use ntex::web;
 
 use skw_lib_shared::{
     APP,
-    prelude::{consts::*, iggy::*, log::*},
+    prelude::{consts::*, log::*, tools::*},
 };
 
 mod cfg;
 mod crypto;
+mod gate;
 mod structs;
 mod tls;
 mod ws;
@@ -21,6 +22,8 @@ static GLOBAL: MiMalloc = MiMalloc;
 #[ntex::main]
 async fn main() -> anyhow::Result<()> {
     let bind_addr = APP.config.expect_string(SERVICE_BIND_ADDRESS);
+    let back_topic = skw_get_back_topic_name();
+    let stream = skw_get_stream_name();
 
     let workers = APP
         .config
@@ -42,10 +45,17 @@ async fn main() -> anyhow::Result<()> {
 
     let tls_config = tls::build_rustls_config()?;
 
+    let iggy = APP.iggy.clone().connect().await;
+    let iggy_client = iggy.inner().expect("bad iggy client");
+
+    let routes_map = gate::init_iggy(&stream, &back_topic, &iggy_client).await?;
+    let ws_state = gate::WsGateState::new(&stream, &back_topic, routes_map, iggy_client).await?;
+
     info!("starting skw-ws-gate listening on https://{}", bind_addr);
 
-    web::server(async || {
+    web::server(async move || {
         web::App::new()
+            .state(ws_state.clone())
             // enable logger
             .middleware(web::middleware::Logger::default())
             // websocket route

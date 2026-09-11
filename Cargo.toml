@@ -21,3 +21,6 @@ rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
+iggy = { workspace = true }
+dashmap = { workspace = true }

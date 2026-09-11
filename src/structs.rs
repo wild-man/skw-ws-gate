@@ -84,4 +84,10 @@ pub(crate) struct WsState {
     pub hb: Instant,
     pub auth: AuthState,
     pub public_key: Option<String>,
+    /// set together with public_key on successful Authorize; forwarded as
+    /// IGGY_HEADER_API_KEY on every request published for this connection
+    pub api_key: Option<Uuid>,
+    /// minted once per connection; used to address this connection in the
+    /// gate's connections registry (registered only after Authorize)
+    pub connection_id: Uuid,
 }

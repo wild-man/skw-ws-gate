@@ -23,9 +23,9 @@
   },
   "topicsMap": {
     "ping":{
-      "customName": "",
-      "partitionsCount": 100,
-      "messageExpiry": 31
+      "partitionsCount": 10,
+      "messageExpiry": 31,
+      "topicTypes": ["public", "open", "signed"]
     }
   }
 }

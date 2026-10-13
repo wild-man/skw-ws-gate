@@ -12,7 +12,7 @@
       "certPath": "./skw-api-gate.cert.pem",
       "keyPath": "./skw-api-gate.key.pem"
     },
-    "authServiceUrl": "http://skw-auth-service",
+    "authServiceUrl": "http://skw-auth-http-service",
     "rootKey": "01a01500-98d5-71fc-9038-71acb78d61c4",
     "heartbeatIntervalSecs": 5,
     "clientTimeoutSecs": 10
@@ -23,9 +23,9 @@
   },
   "topicsMap": {
     "ping":{
-      "customName": "",
       "partitionsCount": 10,
-      "messageExpiry": 31
+      "messageExpiry": 31,
+      "topicTypes": ["public", "open", "signed"]
     }
   }
 }

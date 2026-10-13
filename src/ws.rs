@@ -139,20 +139,19 @@ async fn dispatch_request(
     api_key: Option<Uuid>,
     req: WsRequest,
 ) -> Option<web::ws::Message> {
-    let Some(uri) = req.uri.as_deref().filter(|u| !u.is_empty()) else {
-        return error_message(&req.signature, "missing or empty uri");
+    let uri = req.uri.clone().unwrap_or_default();
+    let mut slug_split = uri.trim_matches('/').split("/");
+
+    let slug1 = slug_split.next();
+    let slug2 = slug_split.next();
+
+    let topic_key = match (slug1, slug2) {
+        (None, _) => return error_message(&req.signature, "missing or empty uri"),
+        (Some(s1), None) => s1,
+        (Some(s1), Some(s2)) => &format!("{s1}/{s2}"),
     };
 
-    let Some(slug1) = uri
-        .trim_start_matches('/')
-        .split('/')
-        .next()
-        .filter(|s| !s.is_empty())
-    else {
-        return error_message(&req.signature, "invalid uri");
-    };
-
-    let Some(producer) = gate_state.routes_map.map.get(slug1).cloned() else {
+    let Some(producer) = gate_state.routes_map.map.get(topic_key).cloned() else {
         return error_message(&req.signature, "unknown service");
     };
 
@@ -160,7 +159,7 @@ async fn dispatch_request(
         req.signature.clone(),
         PendingRequestEntry {
             outbound: outbound_tx.clone(),
-            uri: uri.to_string(),
+            uri: uri.clone(),
             ts_gate_published: Utc::now(),
         },
     );
@@ -170,7 +169,7 @@ async fn dispatch_request(
     // client — mirrors gates/api's 30s BACK_MESSAGE_TIMEOUT / 504 behavior
     let pending_requests = gate_state.pending_requests.clone();
     let sig_for_timeout = req.signature.clone();
-    let uri_for_timeout = uri.to_string();
+
     tokio::spawn(async move {
         tokio::time::sleep(BACK_MESSAGE_TIMEOUT).await;
         if let Some((signature, entry)) = pending_requests.remove(&sig_for_timeout) {
@@ -180,16 +179,17 @@ async fn dispatch_request(
             );
             let _ = entry.outbound.send(WsOutbound::Timeout {
                 signature,
-                uri: uri_for_timeout,
+                uri: uri.clone(),
             });
         }
     });
 
+    let uri = req.uri.unwrap_or_default();
     if let Err(e) = publish_to_service(
         producer,
         api_key.as_ref(),
         &req.signature,
-        uri,
+        &uri,
         req.data.raw_str().as_bytes(),
     )
     .await

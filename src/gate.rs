@@ -198,10 +198,6 @@ fn dispatch_back_message(pending: &DashMap<String, PendingRequestEntry>, connect
     }
 }
 
-/// mirrors gates/api::init_iggy (main.rs:118-199): creates the shared stream,
-/// the shared back topic, and one Iggy producer per service found in
-/// /topicsMap, keyed by service name (the first path segment of a client's
-/// WsRequest.uri, same convention gates/api uses for req.path()).
 pub(crate) async fn init_iggy(stream: &str, back_topic: &str, iggy_client: &IggyClient) -> Result<RoutesMap, AppError> {
     let stream_id = Identifier::from_str_value(stream).expect("invalid stream name");
 
@@ -235,47 +231,47 @@ pub(crate) async fn init_iggy(stream: &str, back_topic: &str, iggy_client: &Iggy
         Some(t) => {
             for (service, topic_cfg) in t.as_object().expect("invalid topic configuration").iter() {
                 let cfg: TopicConfig = topic_cfg.try_into()?;
+                for topic_type in &cfg.topic_types {
+                    let topic = format!("{}-{}-{}", service, topic_type, VERSION);
+                    let topic_key = format!("{service}/{topic_type}");
 
-                let topic = cfg
-                    .custom_name
-                    .unwrap_or(format!("{}-{}", service, VERSION));
+                    skw_is_valid_name(&topic).unwrap_or_else(|| panic!("invalid topic name: {}", topic));
 
-                skw_is_valid_name(&topic).unwrap_or_else(|| panic!("invalid topic name: {}", topic));
+                    match iggy_client
+                        .create_topic(
+                            &stream_id,
+                            &topic,
+                            cfg.partitions_count,
+                            cfg.compression_algorithm,
+                            None,
+                            cfg.message_expiry,
+                            cfg.max_topic_size,
+                        )
+                        .await
+                    {
+                        Ok(t) => info!("created topic: {} (id:{}); stream: {}", topic, t.id, stream),
+                        Err(e) => warn!(
+                            "error create topic: {}; stream: {}; error: {}",
+                            topic, stream, e
+                        ),
+                    }
 
-                match iggy_client
-                    .create_topic(
-                        &stream_id,
-                        &topic,
-                        cfg.partitions_count,
-                        cfg.compression_algorithm,
-                        None,
-                        cfg.message_expiry,
-                        cfg.max_topic_size,
-                    )
-                    .await
-                {
-                    Ok(t) => info!("created topic: {} (id:{}); stream: {}", topic, t.id, stream),
-                    Err(e) => warn!(
-                        "error create topic: {}; stream: {}; error: {}",
-                        topic, stream, e
-                    ),
+                    info!(
+                        "creating producer for service: {}; stream: {}; topic: {};",
+                        service, stream, topic
+                    );
+
+                    let producer = iggy_client
+                        .producer(stream, &topic)
+                        .expect("producer create error")
+                        .partitioning(Partitioning::balanced())
+                        .build();
+
+                    routes_map
+                        .map
+                        .entry(topic_key)
+                        .or_insert(Arc::new(producer));
                 }
-
-                info!(
-                    "creating producer for service: {}; stream: {}; topic: {};",
-                    service, stream, topic
-                );
-
-                let producer = iggy_client
-                    .producer(stream, &topic)
-                    .expect("producer create error")
-                    .partitioning(Partitioning::balanced())
-                    .build();
-
-                routes_map
-                    .map
-                    .entry(service.clone())
-                    .or_insert(Arc::new(producer));
             }
         }
         None => warn!("no topics configurations found in config"),
@@ -284,10 +280,6 @@ pub(crate) async fn init_iggy(stream: &str, back_topic: &str, iggy_client: &Iggy
     Ok(routes_map)
 }
 
-/// ws-adapted port of gates/api::send_message_to_service (main.rs:305-366).
-/// IGGY_HEADER_HTTP_METHOD is set to a fixed "WS" marker since ws requests
-/// have no HTTP method — libs/http-protos's TryInto<JsonRpcServiceRequest<T>>
-/// requires this header to be present regardless of value.
 pub(crate) async fn publish_to_service(
     producer: Arc<IggyProducer>,
     api_key: Option<&Uuid>,

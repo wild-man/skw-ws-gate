@@ -54,8 +54,9 @@ impl<T> Serialize for Signed<T> {
     }
 }
 
+/// Client frame: `{"Signature", "Uri", "Data"}`.
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, rename_all = "PascalCase")]
 pub(crate) struct WsRequest {
     pub signature: String,
     pub uri: Option<String>,
@@ -78,9 +79,9 @@ pub(crate) enum AuthState {
 
 #[derive(Debug)]
 pub(crate) struct WsState {
-    /// Client must send ping at least once per 10 seconds (CLIENT_TIMEOUT),
-    /// otherwise we drop connection. Not refreshed until authorized, so an
-    /// unauthorized connection is dropped after CLIENT_TIMEOUT.
+    /// Client must send ping (or answer ours) at least once per CLIENT_TIMEOUT,
+    /// otherwise we drop connection. Refreshed for unauthorized connections too,
+    /// since public/open requests need no authorization.
     pub hb: Instant,
     pub auth: AuthState,
     pub public_key: Option<String>,

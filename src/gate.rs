@@ -46,6 +46,10 @@ pub(crate) enum WsOutbound {
 
 pub(crate) struct PendingRequestEntry {
     pub outbound: UnboundedSender<WsOutbound>,
+    /// id echoed back to the client as the reply's `Signature`: the request signature for signed
+    /// requests, the client-chosen request id for unsigned ones (whose registry key is minted by
+    /// the gate, so ids picked by different clients can't collide)
+    pub reply_id: String,
     pub uri: String,
     pub ts_gate_published: DateTime<Utc>,
 }
@@ -175,16 +179,16 @@ impl WsGateState {
 /// every connection.
 fn dispatch_back_message(pending: &DashMap<String, PendingRequestEntry>, connections: &DashMap<Uuid, ConnectionEntry>, m: WsBackMessage) {
     if let Some(sig) = &m.signature
-        && let Some((signature, entry)) = pending.remove(sig)
+        && let Some((correlation_id, entry)) = pending.remove(sig)
     {
         debug!(
-            "ws reply delivered: signature={} uri={} elapsed={:?}",
-            signature,
+            "ws reply delivered: correlation_id={} uri={} elapsed={:?}",
+            correlation_id,
             entry.uri,
             Utc::now() - entry.ts_gate_published
         );
         let _ = entry.outbound.send(WsOutbound::Reply {
-            signature,
+            signature: entry.reply_id,
             payload: m.payload,
             service_error: m.service_error,
         });

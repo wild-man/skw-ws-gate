@@ -12,7 +12,9 @@ use crate::cfg::{CFG_CLIENT_TIMEOUT, CFG_HEARTBEAT_INTERVAL};
 use crate::crypto::{check_authorize, verify_signature};
 use crate::gate::{ConnectionEntry, PendingRequestEntry, WsGateState, WsOutbound, publish_to_service};
 use crate::structs::{AuthState, WsMethod, WsRequest, WsState};
-use skw_lib_shared::prelude::{chrono::Utc, consts::BACK_MESSAGE_TIMEOUT, log::*, uuid::Uuid};
+use skw_lib_shared::prelude::{
+    axum::StatusCode, chrono::Utc, consts::BACK_MESSAGE_TIMEOUT, iggy::TopicType, log::*, tools::skw_random_signature, uuid::Uuid,
+};
 
 /// handler for a single incoming websocket frame
 pub(crate) async fn handle_frame(
@@ -22,25 +24,28 @@ pub(crate) async fn handle_frame(
     frame: web::ws::Frame,
 ) -> Result<Option<web::ws::Message>, anyhow::Error> {
     let item = match frame {
-        // update heartbeat (only once authorized)
+        // update heartbeat: any responsive client stays connected, authorized or not,
+        // since public/open requests need no authorization
         web::ws::Frame::Ping(msg) => {
-            if state.borrow().auth == AuthState::Authorized {
-                state.borrow_mut().hb = Instant::now();
-            }
+            state.borrow_mut().hb = Instant::now();
             Some(web::ws::Message::Pong(msg))
         }
 
-        // update heartbeat (only once authorized)
         web::ws::Frame::Pong(_) => {
-            if state.borrow().auth == AuthState::Authorized {
-                state.borrow_mut().hb = Instant::now();
-            }
+            state.borrow_mut().hb = Instant::now();
             None
         }
 
         // validate the frame is valid UTF-8 *and* deserializes into our expected shape
         web::ws::Frame::Text(text) => match serde_json::from_slice::<WsRequest>(&text) {
             Ok(req) => {
+                // public/open topics need neither authorization nor a valid signature (like
+                // gates/api); `Signature` is then only the client's request id, echoed in the reply
+                if is_unsigned_topic(req.uri.as_deref()) {
+                    let correlation_id = skw_random_signature();
+                    return Ok(dispatch_request(&gate_state, &outbound_tx, None, correlation_id, req).await);
+                }
+
                 let auth = state.borrow().auth;
 
                 match auth {
@@ -75,7 +80,7 @@ pub(crate) async fn handle_frame(
                                     );
 
                                     //@todo replace to Payload struct like in api gate
-                                    let reply = serde_json::json!({ "authorized": true }).to_string();
+                                    let reply = serde_json::json!({ "Authorized": true }).to_string();
 
                                     // debug!("{:?}", state);
                                     Some(web::ws::Message::Text(reply.into()))
@@ -99,7 +104,11 @@ pub(crate) async fn handle_frame(
                         };
 
                         match verify_signature(&public_key, &req.signature, req.data.raw_str()) {
-                            Ok(()) => dispatch_request(&gate_state, &outbound_tx, api_key, req).await,
+                            Ok(()) => {
+                                // signature is verified and unforgeable, so it doubles as the correlation id
+                                let correlation_id = req.signature.clone();
+                                dispatch_request(&gate_state, &outbound_tx, api_key, correlation_id, req).await
+                            }
                             Err(_) => unauthorized_close(),
                         }
                     }
@@ -127,16 +136,19 @@ pub(crate) async fn handle_frame(
 }
 
 /// Resolves the target service from `req.uri`, registers a pending-request
-/// entry keyed by `req.signature`, spawns a timeout watchdog, and publishes
-/// the request to the resolved service topic. Returns `None` immediately
-/// without waiting for a reply — the frame-processing service stays free to
-/// handle the next frame (heartbeats, other requests) on this connection
-/// while the reply is delivered later, asynchronously, via the shared
-/// back-topic consumer loop -> outbound channel -> heartbeat task -> sink.
+/// entry keyed by `correlation_id` (also sent to the service as the iggy
+/// signature header), spawns a timeout watchdog, and publishes the request to
+/// the resolved service topic. The reply reaches the client under
+/// `req.signature`. Returns `None` immediately without waiting for a reply —
+/// the frame-processing service stays free to handle the next frame
+/// (heartbeats, other requests) on this connection while the reply is
+/// delivered later, asynchronously, via the shared back-topic consumer loop
+/// -> outbound channel -> heartbeat task -> sink.
 async fn dispatch_request(
     gate_state: &WsGateState,
     outbound_tx: &UnboundedSender<WsOutbound>,
     api_key: Option<Uuid>,
+    correlation_id: String,
     req: WsRequest,
 ) -> Option<web::ws::Message> {
     let uri = req.uri.clone().unwrap_or_default();
@@ -146,19 +158,26 @@ async fn dispatch_request(
     let slug2 = slug_split.next();
 
     let topic_key = match (slug1, slug2) {
-        (None, _) => return error_message(&req.signature, "missing or empty uri"),
+        (None, _) => {
+            return error_message(
+                &req.signature,
+                "missing or empty uri",
+                StatusCode::BAD_REQUEST,
+            );
+        }
         (Some(s1), None) => s1,
         (Some(s1), Some(s2)) => &format!("{s1}/{s2}"),
     };
 
     let Some(producer) = gate_state.routes_map.map.get(topic_key).cloned() else {
-        return error_message(&req.signature, "unknown service");
+        return error_message(&req.signature, "unknown service", StatusCode::BAD_REQUEST);
     };
 
     gate_state.pending_requests.insert(
-        req.signature.clone(),
+        correlation_id.clone(),
         PendingRequestEntry {
             outbound: outbound_tx.clone(),
+            reply_id: req.signature.clone(),
             uri: uri.clone(),
             ts_gate_published: Utc::now(),
         },
@@ -168,17 +187,17 @@ async fn dispatch_request(
     // entry (no reply arrived in time), remove it ourselves and notify the
     // client — mirrors gates/api's 30s BACK_MESSAGE_TIMEOUT / 504 behavior
     let pending_requests = gate_state.pending_requests.clone();
-    let sig_for_timeout = req.signature.clone();
+    let correlation_for_timeout = correlation_id.clone();
 
     tokio::spawn(async move {
         tokio::time::sleep(BACK_MESSAGE_TIMEOUT).await;
-        if let Some((signature, entry)) = pending_requests.remove(&sig_for_timeout) {
+        if let Some((correlation_id, entry)) = pending_requests.remove(&correlation_for_timeout) {
             warn!(
-                "timeout waiting for backend response signature: {}",
-                signature
+                "timeout waiting for backend response correlation_id: {}",
+                correlation_id
             );
             let _ = entry.outbound.send(WsOutbound::Timeout {
-                signature,
+                signature: entry.reply_id,
                 uri: uri.clone(),
             });
         }
@@ -188,18 +207,29 @@ async fn dispatch_request(
     if let Err(e) = publish_to_service(
         producer,
         api_key.as_ref(),
-        &req.signature,
+        &correlation_id,
         &uri,
         req.data.raw_str().as_bytes(),
     )
     .await
     {
         error!("publish to service error: {}", e);
-        gate_state.pending_requests.remove(&req.signature);
-        return error_message(&req.signature, "internal error");
+        gate_state.pending_requests.remove(&correlation_id);
+        return error_message(
+            &req.signature,
+            "internal error",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        );
     }
 
     None
+}
+
+/// `uri` targets a public/open topic (`/{service}/public|open`), which needs no authorization
+fn is_unsigned_topic(uri: Option<&str>) -> bool {
+    uri.and_then(|u| u.trim_matches('/').split('/').nth(1))
+        .and_then(|t| t.parse::<TopicType>().ok())
+        .is_some_and(|t| matches!(t, TopicType::Public | TopicType::Open))
 }
 
 /// WebSockets service factory
@@ -307,7 +337,8 @@ fn build_ws_message(outbound: WsOutbound) -> web::ws::Message {
             let payload: serde_json::Value = serde_json::from_slice(&payload).unwrap_or(serde_json::Value::Null);
             serde_json::json!({
                 "Signature": signature,
-                "Error": service_error.map(|e| e.to_string()),
+                "ErrorMsg": service_error.as_ref().map(|e| e.to_string()),
+                "ErrCode": service_error.map(|e| e.status_code().as_u16()),
                 "Payload": payload,
             })
         }
@@ -316,7 +347,12 @@ fn build_ws_message(outbound: WsOutbound) -> web::ws::Message {
             serde_json::json!({ "Push": true, "Payload": payload })
         }
         WsOutbound::Timeout { signature, uri } => {
-            serde_json::json!({ "Signature": signature, "Error": "Timeout", "Uri": uri })
+            serde_json::json!({
+                "Signature": signature,
+                "ErrorMsg": "Timeout",
+                "ErrCode": StatusCode::GATEWAY_TIMEOUT.as_u16(),
+                "Uri": uri,
+            })
         }
     };
     web::ws::Message::Text(json.to_string().into())
@@ -341,15 +377,16 @@ pub(crate) async fn ws_index(req: web::HttpRequest, state: web::types::State<WsG
 pub(crate) fn unauthorized_close() -> Option<web::ws::Message> {
     Some(web::ws::Message::Close(Some(web::ws::CloseReason {
         code: web::ws::CloseCode::Policy,
-        description: Some("unauthorized".into()), // @todo move to some Payload struct
+        description: Some("Unauthorized".into()), // @todo move to some Payload struct
     })))
 }
 
 // non-terminal error reply for a signed-but-unroutable/unpublishable
 // request; the connection stays open for further requests.
-fn error_message(signature: &str, reason: &str) -> Option<web::ws::Message> {
+// `code` mirrors the HTTP status gates/api answers in the same situation.
+fn error_message(signature: &str, reason: &str, code: StatusCode) -> Option<web::ws::Message> {
     Some(web::ws::Message::Text(
-        serde_json::json!({ "signature": signature, "error": reason })
+        serde_json::json!({ "Signature": signature, "ErrorMsg": reason, "ErrCode": code.as_u16() })
             .to_string()
             .into(),
     ))

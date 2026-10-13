@@ -6,7 +6,7 @@ use skw_lib_shared::prelude::{AppError, base64::*, jsonrpc::*, uuid::*};
 use crate::cfg::CFG_AUTH_SERVICE_URL;
 
 /// Verifies `signature` (base64) against `data` — the raw bytes/text of the
-/// request's `data` field exactly as sent on the wire — using `public_key`
+/// request's `Data` field exactly as sent on the wire — using `public_key`
 /// (base64 SPKI DER). Same scheme as gates/api/src/auth.rs. Verifying
 /// against the original raw text (instead of re-serializing a parsed
 /// struct) means this doesn't depend on the client's JSON codec matching

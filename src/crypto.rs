@@ -14,17 +14,17 @@ use crate::cfg::CFG_AUTH_SERVICE_URL;
 pub(crate) fn verify_signature(public_key: &str, signature: &str, data: &str) -> Result<(), AppError> {
     let public_key_der = BASE64_STANDARD
         .decode(public_key)
-        .map_err(|_| ServiceHttpError::Forbidden)?;
-    let verifying_key = VerifyingKey::from_public_key_der(&public_key_der).map_err(|_| ServiceHttpError::Forbidden)?;
+        .map_err(|_| SkwServiceHttpError::Forbidden)?;
+    let verifying_key = VerifyingKey::from_public_key_der(&public_key_der).map_err(|_| SkwServiceHttpError::Forbidden)?;
 
     let signature_bytes = BASE64_STANDARD
         .decode(signature)
-        .map_err(|_| ServiceHttpError::Forbidden)?;
-    let signature = Signature::from_slice(&signature_bytes).map_err(|_| ServiceHttpError::Forbidden)?;
+        .map_err(|_| SkwServiceHttpError::Forbidden)?;
+    let signature = Signature::from_slice(&signature_bytes).map_err(|_| SkwServiceHttpError::Forbidden)?;
 
     verifying_key
         .verify(data.as_bytes(), &signature)
-        .map_err(|_| ServiceHttpError::Forbidden)?;
+        .map_err(|_| SkwServiceHttpError::Forbidden)?;
 
     Ok(())
 }
@@ -40,7 +40,7 @@ pub(crate) async fn check_authorize(api_key: Uuid, signature: &str, data: &str) 
         .try_into()?;
 
     if !enabled {
-        return Err(ServiceHttpError::Forbidden.into());
+        return Err(SkwServiceHttpError::Forbidden.into());
     }
 
     verify_signature(&public_key, signature, data)?;

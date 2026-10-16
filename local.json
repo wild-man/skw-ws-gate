@@ -26,6 +26,11 @@
       "partitionsCount": 10,
       "messageExpiry": 31,
       "topicTypes": ["public", "open", "signed"]
+    },
+    "dialog":{
+      "partitionsCount": 10,
+      "messageExpiry": 31,
+      "topicTypes": ["signed"]
     }
   }
 }

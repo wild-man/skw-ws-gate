@@ -19,7 +19,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
-anyhow = { workspace = true }
+#anyhow = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 iggy = { workspace = true }

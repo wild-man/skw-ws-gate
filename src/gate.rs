@@ -9,7 +9,7 @@ use skw_lib_shared::{
         consts::*,
         futures::StreamExt,
         iggy::*,
-        jsonrpc::ServiceHttpError,
+        jsonrpc::SkwServiceHttpError,
         log::{debug, error, info, warn},
         tools::*,
         uuid::Uuid,
@@ -33,7 +33,7 @@ pub(crate) enum WsOutbound {
     Reply {
         signature: String,
         payload: Vec<u8>,
-        service_error: Option<ServiceHttpError>,
+        service_error: Option<SkwServiceHttpError>,
     },
     Push {
         payload: Vec<u8>,
@@ -73,30 +73,30 @@ pub(crate) struct WsGateState {
 struct WsBackMessage {
     payload: Vec<u8>,
     signature: Option<String>,
-    service_error: Option<ServiceHttpError>,
+    service_error: Option<SkwServiceHttpError>,
     target_connection_id: Option<Uuid>,
 }
 
 impl TryFrom<ReceivedMessage> for WsBackMessage {
-    type Error = String;
+    type Error = AppError;
 
     fn try_from(m: ReceivedMessage) -> Result<Self, Self::Error> {
-        let signature_key = HeaderKey::from_str(IGGY_HEADER_SIGNATURE).map_err(|e| e.to_string())?;
+        let signature_key = HeaderKey::from_str(IGGY_HEADER_SIGNATURE)?;
         let signature = m
             .message
             .get_user_header(&signature_key)
             .unwrap_or(None)
             .map(|s| s.to_string_value());
 
-        let service_error_key = HeaderKey::from_str(IGGY_HEADER_SERVICE_ERROR).map_err(|e| e.to_string())?;
+        let service_error_key = HeaderKey::from_str(IGGY_HEADER_SERVICE_ERROR)?;
         let service_error = m
             .message
             .get_user_header(&service_error_key)
             .unwrap_or(None)
             .map(|s| s.to_string_value())
-            .and_then(|v| v.parse::<ServiceHttpError>().ok());
+            .and_then(|v| v.parse::<SkwServiceHttpError>().ok());
 
-        let target_key = HeaderKey::from_str(IGGY_HEADER_TARGET_WS_CONNECTION_ID).map_err(|e| e.to_string())?;
+        let target_key = HeaderKey::from_str(IGGY_HEADER_TARGET_WS_CONNECTION_ID)?;
         let target_connection_id = m
             .message
             .get_user_header(&target_key)
@@ -123,11 +123,17 @@ impl WsGateState {
         // gates/api's consumer instead (and silently dropped there). Each gate
         // needs its own distinctly-named group so it independently sees every
         // back-topic message and filters locally.
-        let consumer_name = format!("consumer-ws-{}", back_topic);
+        //
+        // Caveat: every ws-gate *process* uses this same group name, so running
+        // several ws replicas puts them in one group and Iggy splits back
+        // partitions between them — a reply for a request pending on replica A
+        // can land on replica B, miss its `pending_requests`, get dropped, and A
+        // times out. Before scaling horizontally, make the group per-instance or
+        // route replies to a partition owned by the requesting instance.
+        let consumer_name = skw_get_consumer_name(back_topic);
 
         let mut iggy_consumer = iggy_client
-            .consumer_group(&consumer_name, stream, back_topic)
-            .map_err(|e| AppError::Custom(e.to_string()))?
+            .consumer_group(&consumer_name, stream, back_topic)?
             .auto_commit(AutoCommit::When(AutoCommitWhen::ConsumingEachMessage))
             .create_consumer_group_if_not_exists()
             .auto_join_consumer_group()
@@ -136,10 +142,7 @@ impl WsGateState {
             .batch_length(1)
             .build();
 
-        iggy_consumer
-            .init()
-            .await
-            .map_err(|e| AppError::Custom(e.to_string()))?;
+        iggy_consumer.init().await?;
 
         let pending_requests: Arc<DashMap<String, PendingRequestEntry>> = Arc::new(DashMap::with_capacity(1024));
         let connections: Arc<DashMap<Uuid, ConnectionEntry>> = Arc::new(DashMap::with_capacity(1024));
@@ -290,42 +293,38 @@ pub(crate) async fn publish_to_service(
     signature: &str,
     uri: &str,
     body: &[u8],
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     let mut headers = std::collections::BTreeMap::new();
 
     headers.insert(
-        HeaderKey::from_str(IGGY_HEADER_SIGNATURE).unwrap(),
-        HeaderValue::from_str(signature).map_err(|e| e.to_string())?,
+        HeaderKey::from_str(IGGY_HEADER_SIGNATURE)?,
+        HeaderValue::from_str(signature)?,
     );
 
     if let Some(key) = api_key {
         headers.insert(
-            HeaderKey::from_str(IGGY_HEADER_API_KEY).unwrap(),
-            HeaderValue::from_str(&key.to_string()).map_err(|e| e.to_string())?,
+            HeaderKey::from_str(IGGY_HEADER_API_KEY)?,
+            HeaderValue::from_str(&key.to_string())?,
         );
     }
 
     headers.insert(
-        HeaderKey::from_str(IGGY_HEADER_HTTP_METHOD).unwrap(),
-        HeaderValue::from_str("WS").map_err(|e| e.to_string())?,
+        HeaderKey::from_str(IGGY_HEADER_HTTP_METHOD)?,
+        HeaderValue::from_str("WS")?,
     );
 
     headers.insert(
-        HeaderKey::from_str(IGGY_HEADER_HTTP_PATH).unwrap(),
-        HeaderValue::from_str(uri).map_err(|e| e.to_string())?,
+        HeaderKey::from_str(IGGY_HEADER_HTTP_PATH)?,
+        HeaderValue::from_str(uri)?,
     );
 
     let bytes = Bytes::copy_from_slice(body);
     let message = IggyMessage::builder()
         .payload(bytes)
         .user_headers(headers)
-        .build()
-        .map_err(|e| e.to_string())?;
+        .build()?;
 
-    producer
-        .send_one(message)
-        .await
-        .map_err(|e| e.to_string())?;
+    producer.send_one(message).await?;
 
     Ok(())
 }

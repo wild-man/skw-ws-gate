@@ -1,7 +1,7 @@
 use ntex::web;
 
 use skw_lib_shared::{
-    APP,
+    APP, AppError,
     prelude::{consts::*, log::*, tools::*},
 };
 
@@ -20,7 +20,7 @@ use mimalloc::MiMalloc;
 static GLOBAL: MiMalloc = MiMalloc;
 
 #[ntex::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<(), AppError> {
     let bind_addr = APP.config.expect_string(SERVICE_BIND_ADDRESS);
     let back_topic = skw_get_back_topic_name();
     let stream = skw_get_stream_name();
@@ -61,10 +61,12 @@ async fn main() -> anyhow::Result<()> {
             // websocket route
             .service(web::resource("/ws/").route(web::get().to(ws_index)))
     })
-    .bind_rustls(&bind_addr, &tls_config)?
+    .bind_rustls(&bind_addr, &tls_config)
+    .map_err(|e| AppError::Custom(e.to_string()))?
     .workers(workers)
     .run()
-    .await?;
+    .await
+    .map_err(|e| AppError::Custom(e.to_string()))?;
 
     Ok(())
 }

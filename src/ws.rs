@@ -6,6 +6,7 @@ use ntex::web;
 use ntex::{chain, fn_service};
 use ntex::{channel::oneshot, rt, time};
 
+use skw_lib_shared::AppError;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::cfg::{CFG_CLIENT_TIMEOUT, CFG_HEARTBEAT_INTERVAL};
@@ -13,7 +14,7 @@ use crate::crypto::{check_authorize, verify_signature};
 use crate::gate::{ConnectionEntry, PendingRequestEntry, WsGateState, WsOutbound, publish_to_service};
 use crate::structs::{AuthState, WsMethod, WsRequest, WsState};
 use skw_lib_shared::prelude::{
-    axum::StatusCode, chrono::Utc, consts::BACK_MESSAGE_TIMEOUT, iggy::TopicType, log::*, tools::skw_random_signature, uuid::Uuid,
+    axum::StatusCode, chrono::Utc, consts::BACK_MESSAGE_TIMEOUT, iggy::SkwTopicType, log::*, tools::skw_random_signature, uuid::Uuid,
 };
 
 /// handler for a single incoming websocket frame
@@ -22,7 +23,7 @@ pub(crate) async fn handle_frame(
     gate_state: WsGateState,
     outbound_tx: UnboundedSender<WsOutbound>,
     frame: web::ws::Frame,
-) -> Result<Option<web::ws::Message>, anyhow::Error> {
+) -> Result<Option<web::ws::Message>, AppError> {
     let item = match frame {
         // update heartbeat: any responsive client stays connected, authorized or not,
         // since public/open requests need no authorization
@@ -228,15 +229,15 @@ async fn dispatch_request(
 /// `uri` targets a public/open topic (`/{service}/public|open`), which needs no authorization
 fn is_unsigned_topic(uri: Option<&str>) -> bool {
     uri.and_then(|u| u.trim_matches('/').split('/').nth(1))
-        .and_then(|t| t.parse::<TopicType>().ok())
-        .is_some_and(|t| matches!(t, TopicType::Public | TopicType::Open))
+        .and_then(|t| t.parse::<SkwTopicType>().ok())
+        .is_some_and(|t| matches!(t, SkwTopicType::Public | SkwTopicType::Open))
 }
 
 /// WebSockets service factory
 pub(crate) async fn ws_service(
     sink: web::ws::WsSink,
     gate_state: WsGateState,
-) -> Result<impl Service<web::ws::Frame, Response = Option<web::ws::Message>, Error = anyhow::Error>, web::Error> {
+) -> Result<impl Service<web::ws::Frame, Response = Option<web::ws::Message>, Error = AppError>, web::Error> {
     let connection_id = Uuid::now_v7();
 
     let state = Rc::new(RefCell::new(WsState {

@@ -28,23 +28,30 @@ pub(crate) async fn handle_frame(
         // update heartbeat: any responsive client stays connected, authorized or not,
         // since public/open requests need no authorization
         web::ws::Frame::Ping(msg) => {
+            trace!("ws ping <- connection {}", state.borrow().connection_id);
             state.borrow_mut().hb = Instant::now();
             Some(web::ws::Message::Pong(msg))
         }
 
         web::ws::Frame::Pong(_) => {
+            trace!("ws pong <- connection {}", state.borrow().connection_id);
             state.borrow_mut().hb = Instant::now();
             None
         }
 
         // validate the frame is valid UTF-8 *and* deserializes into our expected shape
-        web::ws::Frame::Text(text) => match serde_json::from_slice::<WsRequest>(&text) {
+        // any client frame proves it is alive: browsers can't send pings, and their pongs
+        // only answer ours
+        web::ws::Frame::Text(text) => match {
+            state.borrow_mut().hb = Instant::now();
+            serde_json::from_slice::<WsRequest>(&text)
+        } {
             Ok(req) => {
                 // public/open topics need neither authorization nor a valid signature (like
                 // gates/api); `Signature` is then only the client's request id, echoed in the reply
                 if is_unsigned_topic(req.uri.as_deref()) {
-                    let correlation_id = skw_random_signature();
-                    return Ok(dispatch_request(&gate_state, &outbound_tx, None, correlation_id, req).await);
+                    let rnd_signature = skw_random_signature();
+                    return Ok(dispatch_request(&gate_state, &outbound_tx, None, rnd_signature, req).await);
                 }
 
                 let auth = state.borrow().auth;
@@ -107,8 +114,8 @@ pub(crate) async fn handle_frame(
                         match verify_signature(&public_key, &req.signature, req.data.raw_str()) {
                             Ok(()) => {
                                 // signature is verified and unforgeable, so it doubles as the correlation id
-                                let correlation_id = req.signature.clone();
-                                dispatch_request(&gate_state, &outbound_tx, api_key, correlation_id, req).await
+                                let signature = req.signature.clone();
+                                dispatch_request(&gate_state, &outbound_tx, api_key, signature, req).await
                             }
                             Err(_) => unauthorized_close(),
                         }
@@ -137,7 +144,7 @@ pub(crate) async fn handle_frame(
 }
 
 /// Resolves the target service from `req.uri`, registers a pending-request
-/// entry keyed by `correlation_id` (also sent to the service as the iggy
+/// entry keyed by `signature` (also sent to the service as the iggy
 /// signature header), spawns a timeout watchdog, and publishes the request to
 /// the resolved service topic. The reply reaches the client under
 /// `req.signature`. Returns `None` immediately without waiting for a reply —
@@ -149,7 +156,7 @@ async fn dispatch_request(
     gate_state: &WsGateState,
     outbound_tx: &UnboundedSender<WsOutbound>,
     api_key: Option<Uuid>,
-    correlation_id: String,
+    signature: String,
     req: WsRequest,
 ) -> Option<web::ws::Message> {
     let uri = req.uri.clone().unwrap_or_default();
@@ -175,7 +182,7 @@ async fn dispatch_request(
     };
 
     gate_state.pending_requests.insert(
-        correlation_id.clone(),
+        signature.clone(),
         PendingRequestEntry {
             outbound: outbound_tx.clone(),
             reply_id: req.signature.clone(),
@@ -188,14 +195,14 @@ async fn dispatch_request(
     // entry (no reply arrived in time), remove it ourselves and notify the
     // client — mirrors gates/api's 30s BACK_MESSAGE_TIMEOUT / 504 behavior
     let pending_requests = gate_state.pending_requests.clone();
-    let correlation_for_timeout = correlation_id.clone();
+    let signature_for_timeout = signature.clone();
 
     tokio::spawn(async move {
         tokio::time::sleep(BACK_MESSAGE_TIMEOUT).await;
-        if let Some((correlation_id, entry)) = pending_requests.remove(&correlation_for_timeout) {
+        if let Some((signature, entry)) = pending_requests.remove(&signature_for_timeout) {
             warn!(
-                "timeout waiting for backend response correlation_id: {}",
-                correlation_id
+                "timeout waiting for backend response signature: {}",
+                signature
             );
             let _ = entry.outbound.send(WsOutbound::Timeout {
                 signature: entry.reply_id,
@@ -208,14 +215,14 @@ async fn dispatch_request(
     if let Err(e) = publish_to_service(
         producer,
         api_key.as_ref(),
-        &correlation_id,
+        &signature,
         &uri,
         req.data.raw_str().as_bytes(),
     )
     .await
     {
         error!("publish to service error: {}", e);
-        gate_state.pending_requests.remove(&correlation_id);
+        gate_state.pending_requests.remove(&signature);
         return error_message(
             &req.signature,
             "internal error",
@@ -294,9 +301,13 @@ pub(crate) async fn heartbeat(
     mut rx: oneshot::Receiver<()>,
     mut outbound_rx: tokio::sync::mpsc::UnboundedReceiver<WsOutbound>,
 ) {
+    // one interval for the whole connection: a `sleep` created per loop pass would be
+    // restarted by every outbound message, so a busy connection never got pinged and was
+    // dropped as silent once its replies stopped
+    let ping = time::interval(*CFG_HEARTBEAT_INTERVAL);
     loop {
         tokio::select! {
-            _ = time::sleep(*CFG_HEARTBEAT_INTERVAL) => {
+            _ = ping.tick() => {
                 // check client heartbeats
                 if Instant::now().duration_since(state.borrow().hb) > *CFG_CLIENT_TIMEOUT {
                     // heartbeat timed out
@@ -306,6 +317,7 @@ pub(crate) async fn heartbeat(
                 }
 
                 // send ping
+                debug!("ws ping -> connection {}", state.borrow().connection_id);
                 if sink.send(web::ws::Message::Ping(Bytes::default())).await.is_err() {
                     return;
                 }
@@ -319,6 +331,7 @@ pub(crate) async fn heartbeat(
                     // all senders dropped; connection teardown handled by the other branches
                     continue;
                 };
+
                 if sink.send(build_ws_message(msg)).await.is_err() {
                     return;
                 }
@@ -327,17 +340,26 @@ pub(crate) async fn heartbeat(
     }
 }
 
-//@todo replace to Payload struct like in api gate
 fn build_ws_message(outbound: WsOutbound) -> web::ws::Message {
     let json = match outbound {
         WsOutbound::Reply {
             signature,
             payload,
             service_error,
+            service_status,
         } => {
             let payload: serde_json::Value = serde_json::from_slice(&payload).unwrap_or(serde_json::Value::Null);
+            // HTTP status the api gate answers with: error code, 201/202 for a provisional reply
+            // (request taken, its result comes later), else 200
+            let status = service_error
+                .as_ref()
+                .map(|e| e.status_code())
+                .or(service_status.map(|s| s.status_code()))
+                .unwrap_or(StatusCode::OK);
+
             serde_json::json!({
                 "Signature": signature,
+                "Status": status.as_u16(),
                 "ErrorMsg": service_error.as_ref().map(|e| e.to_string()),
                 "ErrCode": service_error.map(|e| e.status_code().as_u16()),
                 "Payload": payload,

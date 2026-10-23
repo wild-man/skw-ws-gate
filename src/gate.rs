@@ -9,7 +9,7 @@ use skw_lib_shared::{
         consts::*,
         futures::StreamExt,
         iggy::*,
-        jsonrpc::SkwServiceHttpError,
+        jsonrpc::{SkwServiceHttpError, SkwServiceStatus},
         log::{debug, error, info, warn},
         tools::*,
         uuid::Uuid,
@@ -18,7 +18,7 @@ use skw_lib_shared::{
 
 use tokio::sync::mpsc::UnboundedSender;
 
-pub(crate) const CFG_BACK_TOPIC_PART_COUNT: &str = "/service/backTopicpartitionsCount";
+pub(crate) const CFG_BACK_TOPIC_PART_COUNT: &str = "/service/backTopicPartitionsCount";
 
 #[derive(Clone)]
 pub(crate) struct RoutesMap {
@@ -34,6 +34,8 @@ pub(crate) enum WsOutbound {
         signature: String,
         payload: Vec<u8>,
         service_error: Option<SkwServiceHttpError>,
+        /// Some = provisional reply (Created/Accepted): request taken, its result comes later
+        service_status: Option<SkwServiceStatus>,
     },
     Push {
         payload: Vec<u8>,
@@ -74,6 +76,7 @@ struct WsBackMessage {
     payload: Vec<u8>,
     signature: Option<String>,
     service_error: Option<SkwServiceHttpError>,
+    service_status: Option<SkwServiceStatus>,
     target_connection_id: Option<Uuid>,
 }
 
@@ -96,6 +99,14 @@ impl TryFrom<ReceivedMessage> for WsBackMessage {
             .map(|s| s.to_string_value())
             .and_then(|v| v.parse::<SkwServiceHttpError>().ok());
 
+        let service_status_key = HeaderKey::from_str(IGGY_HEADER_SERVICE_STATUS)?;
+        let service_status = m
+            .message
+            .get_user_header(&service_status_key)
+            .unwrap_or(None)
+            .map(|s| s.to_string_value())
+            .and_then(|v| v.parse::<SkwServiceStatus>().ok());
+
         let target_key = HeaderKey::from_str(IGGY_HEADER_TARGET_WS_CONNECTION_ID)?;
         let target_connection_id = m
             .message
@@ -108,6 +119,7 @@ impl TryFrom<ReceivedMessage> for WsBackMessage {
             payload: m.message.payload.to_vec(),
             signature,
             service_error,
+            service_status,
             target_connection_id,
         })
     }
@@ -181,12 +193,35 @@ impl WsGateState {
 /// any pending request. No fan-out: O(1) lookup instead of broadcasting to
 /// every connection.
 fn dispatch_back_message(pending: &DashMap<String, PendingRequestEntry>, connections: &DashMap<Uuid, ConnectionEntry>, m: WsBackMessage) {
-    if let Some(sig) = &m.signature
-        && let Some((correlation_id, entry)) = pending.remove(sig)
+    // a provisional reply (Created/Accepted) is delivered but keeps the request pending:
+    // its final reply comes later with the same signature (or the watchdog times it out)
+    if m.service_status.is_some()
+        && let Some(sig) = &m.signature
+        && let Some(entry) = pending.get(sig)
     {
         debug!(
-            "ws reply delivered: correlation_id={} uri={} elapsed={:?}",
-            correlation_id,
+            "ws provisional reply delivered: signature={} uri={} status={:?} elapsed={:?}",
+            sig,
+            entry.uri,
+            m.service_status,
+            Utc::now() - entry.ts_gate_published
+        );
+        let _ = entry.outbound.send(WsOutbound::Reply {
+            signature: entry.reply_id.clone(),
+            payload: m.payload,
+            service_error: m.service_error,
+            service_status: m.service_status,
+        });
+        return;
+    }
+
+    // nothing sends a later reply for its signature (tasks can't report completion yet)
+    if let Some(sig) = &m.signature
+        && let Some((signature, entry)) = pending.remove(sig)
+    {
+        debug!(
+            "ws reply delivered: signature={} uri={} elapsed={:?}",
+            signature,
             entry.uri,
             Utc::now() - entry.ts_gate_published
         );
@@ -194,6 +229,7 @@ fn dispatch_back_message(pending: &DashMap<String, PendingRequestEntry>, connect
             signature: entry.reply_id,
             payload: m.payload,
             service_error: m.service_error,
+            service_status: m.service_status,
         });
         return;
     }

@@ -6,7 +6,7 @@
     "name": "skw-ws-gate",
     "bindAddress": "0.0.0.0:9443",
     "workers": 10,
-    "backTopicpartitionsCount": 7,
+    "backTopicPartitionsCount": 7,
     "tls": {
       "subjectAltNames": ["localhost", "127.0.0.1", "skw-api-gate"],
       "certPath": "../../conf/skw-api-gate.cert.pem",

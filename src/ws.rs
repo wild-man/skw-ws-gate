@@ -1,5 +1,7 @@
 use std::{cell::RefCell, rc::Rc, time::Instant};
 
+use dashmap::mapref::entry::Entry;
+
 use ntex::service::{Service, fn_factory_with_config, fn_shutdown};
 use ntex::util::Bytes;
 use ntex::web;
@@ -14,8 +16,21 @@ use crate::crypto::{check_authorize, verify_signature};
 use crate::gate::{ConnectionEntry, PendingRequestEntry, WsGateState, WsOutbound, publish_to_service};
 use crate::structs::{AuthState, WsMethod, WsRequest, WsState};
 use skw_lib_shared::prelude::{
-    axum::StatusCode, chrono::Utc, consts::BACK_MESSAGE_TIMEOUT, iggy::SkwTopicType, log::*, tools::skw_random_signature, uuid::Uuid,
+    axum::StatusCode,
+    chrono::Utc,
+    consts::BACK_MESSAGE_TIMEOUT,
+    iggy::SkwTopicType,
+    log::*,
+    tools::{skw_is_outdated, skw_random_signature},
+    uuid::Uuid,
 };
+
+/// Marks the client alive and passes `parsed` through: any client text frame proves it is
+/// alive, since browsers can't send pings and their pongs only answer ours.
+fn refresh_hb<T>(state: &RefCell<WsState>, parsed: T) -> T {
+    state.borrow_mut().hb = Instant::now();
+    parsed
+}
 
 /// handler for a single incoming websocket frame
 pub(crate) async fn handle_frame(
@@ -40,12 +55,7 @@ pub(crate) async fn handle_frame(
         }
 
         // validate the frame is valid UTF-8 *and* deserializes into our expected shape
-        // any client frame proves it is alive: browsers can't send pings, and their pongs
-        // only answer ours
-        web::ws::Frame::Text(text) => match {
-            state.borrow_mut().hb = Instant::now();
-            serde_json::from_slice::<WsRequest>(&text)
-        } {
+        web::ws::Frame::Text(text) => match refresh_hb(&state, serde_json::from_slice::<WsRequest>(&text)) {
             Ok(req) => {
                 // public/open topics need neither authorization nor a valid signature (like
                 // gates/api); `Signature` is then only the client's request id, echoed in the reply
@@ -67,6 +77,14 @@ pub(crate) async fn handle_frame(
 
                         match serde_json::from_value::<WsMethod>(req.data.method.clone()) {
                             Ok(WsMethod::Authorize { api_key }) => match check_authorize(api_key, &req.signature, req.data.raw_str()).await {
+                                // an old Authorize frame must not open a session: it fails like bad credentials
+                                Ok(_) if skw_is_outdated(req.data.ts) => {
+                                    warn!(
+                                        "outdated Authorize frame, Ts: {}; api key: {}",
+                                        req.data.ts, api_key
+                                    );
+                                    unauthorized_close()
+                                }
                                 Ok(public_key) => {
                                     let connection_id = {
                                         let mut state = state.borrow_mut();
@@ -112,6 +130,15 @@ pub(crate) async fn handle_frame(
                         };
 
                         match verify_signature(&public_key, &req.signature, req.data.raw_str()) {
+                            // valid key, but an old (possibly replayed) or future-dated frame:
+                            // refuse the frame, keep the connection
+                            Ok(()) if skw_is_outdated(req.data.ts) => {
+                                warn!(
+                                    "outdated signed frame, Ts: {}; signature: {}",
+                                    req.data.ts, req.signature
+                                );
+                                error_message(&req.signature, "request outdated", StatusCode::CONFLICT)
+                            }
                             Ok(()) => {
                                 // signature is verified and unforgeable, so it doubles as the correlation id
                                 let signature = req.signature.clone();
@@ -181,15 +208,26 @@ async fn dispatch_request(
         return error_message(&req.signature, "unknown service", StatusCode::BAD_REQUEST);
     };
 
-    gate_state.pending_requests.insert(
-        signature.clone(),
-        PendingRequestEntry {
-            outbound: outbound_tx.clone(),
-            reply_id: req.signature.clone(),
-            uri: uri.clone(),
-            ts_gate_published: Utc::now(),
-        },
-    );
+    // a signed request's signature is its key: a duplicate still in flight would overwrite the
+    // first entry and run the request twice, so it is refused until the first one is answered
+    match gate_state.pending_requests.entry(signature.clone()) {
+        Entry::Occupied(_) => {
+            warn!("request already pending, signature: {}", signature);
+            return error_message(
+                &req.signature,
+                "request already pending",
+                StatusCode::CONFLICT,
+            );
+        }
+        Entry::Vacant(slot) => {
+            slot.insert(PendingRequestEntry {
+                outbound: outbound_tx.clone(),
+                reply_id: req.signature.clone(),
+                uri: uri.clone(),
+                ts_gate_published: Utc::now(),
+            });
+        }
+    }
 
     // timeout watchdog: if the back-topic consumer loop never removes this
     // entry (no reply arrived in time), remove it ourselves and notify the
@@ -319,20 +357,21 @@ pub(crate) async fn heartbeat(
                 // send ping
                 debug!("ws ping -> connection {}", state.borrow().connection_id);
                 if sink.send(web::ws::Message::Ping(Bytes::default())).await.is_err() {
+                    warn!("Websocket Client heartbeat failed, disconnecting!");
+                    sink.io().terminate();
                     return;
                 }
             }
             _ = &mut rx => {
                 warn!("Connection is dropped, stop heartbeat task");
+                sink.io().terminate();
                 return;
             }
-            msg = outbound_rx.recv() => {
-                let Some(msg) = msg else {
-                    // all senders dropped; connection teardown handled by the other branches
-                    continue;
-                };
-
+            // once all senders are dropped `recv()` yields `None` at once on every poll; a failed
+            // pattern disables this branch instead of spinning, teardown is up to the other branches
+            Some(msg) = outbound_rx.recv() => {
                 if sink.send(build_ws_message(msg)).await.is_err() {
+                    sink.io().terminate();
                     return;
                 }
             }
@@ -413,4 +452,84 @@ fn error_message(signature: &str, reason: &str, code: StatusCode) -> Option<web:
             .to_string()
             .into(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use skw_lib_shared::prelude::jsonrpc::{SkwServiceHttpError, SkwServiceStatus};
+
+    #[test]
+    fn unsigned_topics() {
+        assert!(is_unsigned_topic(Some("/ping/open")));
+        assert!(is_unsigned_topic(Some("ping/public/")));
+        assert!(is_unsigned_topic(Some("/ping/OPEN"))); // SkwTopicType parses case-insensitively
+        assert!(!is_unsigned_topic(Some("/ping/signed")));
+        assert!(!is_unsigned_topic(Some("/ping")));
+        assert!(!is_unsigned_topic(Some("/ping/bogus")));
+        assert!(!is_unsigned_topic(Some("")));
+        assert!(!is_unsigned_topic(None));
+    }
+
+    fn reply_json(outbound: WsOutbound) -> serde_json::Value {
+        let web::ws::Message::Text(text) = build_ws_message(outbound) else {
+            panic!("expected a text frame");
+        };
+        serde_json::from_str(&text).unwrap()
+    }
+
+    fn reply(service_error: Option<SkwServiceHttpError>, service_status: Option<SkwServiceStatus>) -> serde_json::Value {
+        reply_json(WsOutbound::Reply {
+            signature: "sig".into(),
+            payload: br#"{"Ping":{"Count":1}}"#.to_vec(),
+            service_error,
+            service_status,
+        })
+    }
+
+    #[test]
+    fn final_reply_is_200() {
+        let r = reply(None, None);
+        assert_eq!(r["Signature"], "sig");
+        assert_eq!(r["Status"], 200);
+        assert!(r["ErrCode"].is_null());
+        assert_eq!(r["Payload"]["Ping"]["Count"], 1);
+    }
+
+    #[test]
+    fn provisional_replies_are_201_202() {
+        assert_eq!(reply(None, Some(SkwServiceStatus::Created))["Status"], 201);
+        assert_eq!(reply(None, Some(SkwServiceStatus::Accepted))["Status"], 202);
+        assert!(reply(None, Some(SkwServiceStatus::Accepted))["ErrCode"].is_null());
+    }
+
+    #[test]
+    fn error_reply_carries_err_code() {
+        let r = reply(Some(SkwServiceHttpError::NotFound), None);
+        assert_eq!(r["Status"], 404);
+        assert_eq!(r["ErrCode"], 404);
+        assert_eq!(r["ErrorMsg"], "NotFound");
+    }
+
+    #[test]
+    fn invalid_payload_becomes_null() {
+        let r = reply_json(WsOutbound::Reply {
+            signature: "sig".into(),
+            payload: b"not json".to_vec(),
+            service_error: None,
+            service_status: None,
+        });
+        assert!(r["Payload"].is_null());
+    }
+
+    #[test]
+    fn timeout_is_504() {
+        let r = reply_json(WsOutbound::Timeout {
+            signature: "sig".into(),
+            uri: "/ping/signed".into(),
+        });
+        assert_eq!(r["Signature"], "sig");
+        assert_eq!(r["ErrCode"], 504);
+        assert_eq!(r["ErrorMsg"], "Timeout");
+    }
 }

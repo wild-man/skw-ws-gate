@@ -45,8 +45,7 @@ async fn main() -> Result<(), AppError> {
 
     let tls_config = tls::build_rustls_config()?;
 
-    let iggy = APP.iggy.clone().connect().await;
-    let iggy_client = iggy.inner().expect("bad iggy client");
+    let iggy_client = APP.iggy.clone().connect().await?.inner();
 
     let routes_map = gate::init_iggy(&stream, &back_topic, &iggy_client).await?;
     let ws_state = gate::WsGateState::new(&stream, &back_topic, routes_map, iggy_client).await?;

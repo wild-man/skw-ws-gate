@@ -92,3 +92,54 @@ pub(crate) struct WsState {
     /// gate's connections registry (registered only after Authorize)
     pub connection_id: Uuid,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signed_keeps_exact_client_bytes() {
+        // odd spacing and key order: re-serializing would change these bytes and break the signature
+        let data = r#"{ "Params":{},  "Method":"Ping","Ts":"2026-01-01T00:00:00Z" }"#;
+        let frame = format!(r#"{{"Signature":"s","Uri":"/ping/signed","Data":{data}}}"#);
+
+        let req: WsRequest = serde_json::from_str(&frame).unwrap();
+
+        assert_eq!(req.data.raw_str(), data);
+        assert_eq!(req.data.method["Method"], "Ping");
+        assert_eq!(req.uri.as_deref(), Some("/ping/signed"));
+    }
+
+    #[test]
+    fn signed_reserializes_verbatim() {
+        let frame = r#"{"Signature":"s","Uri":null,"Data":{"Ts":"2026-01-01T00:00:00Z",  "Method":"Ping"}}"#;
+        let req: WsRequest = serde_json::from_str(frame).unwrap();
+        assert_eq!(serde_json::to_string(&req).unwrap(), frame);
+    }
+
+    #[test]
+    fn invalid_frames_are_rejected() {
+        for bad in [
+            r#"{"Signature":"s","Data":{"Ts":"2026-01-01T00:00:00Z","Method":"Ping"},"Extra":1}"#, // deny_unknown_fields
+            r#"{"Signature":"s","Data":{"Method":"Ping"}}"#,                                       // no Ts
+            r#"{"Data":{"Ts":"2026-01-01T00:00:00Z","Method":"Ping"}}"#,                           // no Signature
+            r#"{"Signature":"s","Data":{"Ts":"2026-01-01T00:00:00Z","Method":"Ping"}"#,            // truncated
+        ] {
+            assert!(
+                serde_json::from_str::<WsRequest>(bad).is_err(),
+                "accepted: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn authorize_method_parses() {
+        let m: WsMethod = serde_json::from_value(serde_json::json!({
+            "Method": "Authorize",
+            "Params": { "ApiKey": "01a01500-98d5-71fc-9038-71acb78d61c4" }
+        }))
+        .unwrap();
+        let WsMethod::Authorize { api_key } = m;
+        assert_eq!(api_key.to_string(), "01a01500-98d5-71fc-9038-71acb78d61c4");
+    }
+}

@@ -20,6 +20,9 @@ use tokio::sync::mpsc::UnboundedSender;
 
 pub(crate) const CFG_BACK_TOPIC_PART_COUNT: &str = "/service/backTopicPartitionsCount";
 
+/// pause between attempts to rebuild the back-topic consumer after its stream ended
+const BACK_CONSUMER_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
 #[derive(Clone)]
 pub(crate) struct RoutesMap {
     pub map: HashMap<String, Arc<IggyProducer>>,
@@ -84,51 +87,25 @@ impl TryFrom<ReceivedMessage> for WsBackMessage {
     type Error = AppError;
 
     fn try_from(m: ReceivedMessage) -> Result<Self, Self::Error> {
-        let signature_key = HeaderKey::from_str(IGGY_HEADER_SIGNATURE)?;
-        let signature = m
-            .message
-            .get_user_header(&signature_key)
-            .unwrap_or(None)
-            .map(|s| s.to_string_value());
-
-        let service_error_key = HeaderKey::from_str(IGGY_HEADER_SERVICE_ERROR)?;
-        let service_error = m
-            .message
-            .get_user_header(&service_error_key)
-            .unwrap_or(None)
-            .map(|s| s.to_string_value())
-            .and_then(|v| v.parse::<SkwServiceHttpError>().ok());
-
-        let service_status_key = HeaderKey::from_str(IGGY_HEADER_SERVICE_STATUS)?;
-        let service_status = m
-            .message
-            .get_user_header(&service_status_key)
-            .unwrap_or(None)
-            .map(|s| s.to_string_value())
-            .and_then(|v| v.parse::<SkwServiceStatus>().ok());
-
-        let target_key = HeaderKey::from_str(IGGY_HEADER_TARGET_WS_CONNECTION_ID)?;
-        let target_connection_id = m
-            .message
-            .get_user_header(&target_key)
-            .unwrap_or(None)
-            .map(|s| s.to_string_value())
-            .and_then(|v| Uuid::parse_str(&v).ok());
+        // decoded once: every `get_user_header` call would decode the whole map again
+        let headers = m.message.user_headers_map()?;
+        let header = |key: &HeaderKey| header_str(headers.as_ref(), key);
 
         Ok(WsBackMessage {
+            signature: header(&header_keys::SIGNATURE),
+            service_error: header(&header_keys::SERVICE_ERROR).and_then(|v| v.parse().ok()),
+            service_status: header(&header_keys::SERVICE_STATUS).and_then(|v| v.parse().ok()),
+            target_connection_id: header(&header_keys::TARGET_WS_CONNECTION_ID).and_then(|v| Uuid::parse_str(&v).ok()),
             payload: m.message.payload.to_vec(),
-            signature,
-            service_error,
-            service_status,
-            target_connection_id,
         })
     }
 }
 
 impl WsGateState {
     pub(crate) async fn new(stream: &str, back_topic: &str, routes_map: RoutesMap, iggy_client: Arc<IggyClient>) -> Result<Self, AppError> {
-        // gates/api joins a consumer group literally named "consumer-{back_topic}"
-        // on this same shared back topic. Reusing that exact name here would put
+        // The group name is "consumer-{service name}-{back_topic}" (skw_get_consumer_name, service
+        // name from /service/name, "skw-ws-gate"); gates/api uses its own service name on this
+        // same shared back topic. A shared name would put
         // both gates in the SAME Iggy consumer group, which splits partitions
         // between group members instead of giving each gate the full message
         // stream — replies meant for a gates/ws client could get delivered to
@@ -144,27 +121,20 @@ impl WsGateState {
         // route replies to a partition owned by the requesting instance.
         let consumer_name = skw_get_consumer_name(back_topic);
 
-        let mut iggy_consumer = iggy_client
-            .consumer_group(&consumer_name, stream, back_topic)?
-            .auto_commit(AutoCommit::When(AutoCommitWhen::ConsumingEachMessage))
-            .create_consumer_group_if_not_exists()
-            .auto_join_consumer_group()
-            .polling_strategy(PollingStrategy::next())
-            .poll_interval(IggyDuration::from_str("1ms").map_err(|e| AppError::Custom(e.to_string()))?)
-            .batch_length(1)
-            .build();
-
-        iggy_consumer.init().await?;
+        // fail fast at startup; later failures are retried by the receiver loop below
+        let mut iggy_consumer = build_back_consumer(&iggy_client, &consumer_name, stream, back_topic).await?;
 
         let pending_requests: Arc<DashMap<String, PendingRequestEntry>> = Arc::new(DashMap::with_capacity(1024));
         let connections: Arc<DashMap<Uuid, ConnectionEntry>> = Arc::new(DashMap::with_capacity(1024));
 
         let pr = pending_requests.clone();
         let conns = connections.clone();
-        let consumer_name1 = consumer_name.clone();
+        let client = iggy_client.clone();
+        let stream = stream.to_string();
+        let back_topic = back_topic.to_string();
         tokio::spawn(async move {
             loop {
-                info!("starting ws-gate back receiver thread {}", consumer_name1);
+                info!("starting ws-gate back receiver thread {}", consumer_name);
                 while let Some(message) = iggy_consumer.next().await {
                     match message {
                         Ok(received) => match WsBackMessage::try_from(received) {
@@ -174,6 +144,20 @@ impl WsGateState {
                         Err(e) => error!("Error while receiving message: {}", e),
                     }
                 }
+
+                // an ended stream stays ended: polling it again would spin without awaiting,
+                // so rebuild the consumer (with a pause between attempts) and carry on
+                warn!(
+                    "ws-gate back receiver stream ended, rebuilding consumer {}",
+                    consumer_name
+                );
+                iggy_consumer = loop {
+                    tokio::time::sleep(BACK_CONSUMER_RETRY_DELAY).await;
+                    match build_back_consumer(&client, &consumer_name, &stream, &back_topic).await {
+                        Ok(c) => break c,
+                        Err(e) => error!("rebuilding back consumer {} failed: {}", consumer_name, e),
+                    }
+                };
             }
         });
 
@@ -184,6 +168,22 @@ impl WsGateState {
             _iggy_client: iggy_client,
         })
     }
+}
+
+/// Joins (creating if needed) the back-topic consumer group and initializes the consumer.
+async fn build_back_consumer(iggy_client: &IggyClient, consumer_name: &str, stream: &str, back_topic: &str) -> Result<IggyConsumer, AppError> {
+    let mut iggy_consumer = iggy_client
+        .consumer_group(consumer_name, stream, back_topic)?
+        .auto_commit(AutoCommit::When(AutoCommitWhen::ConsumingEachMessage))
+        .create_consumer_group_if_not_exists()
+        .auto_join_consumer_group()
+        .polling_strategy(PollingStrategy::next())
+        .poll_interval(IggyDuration::from_str("1ms").map_err(|e| AppError::Custom(e.to_string()))?)
+        .batch_length(1)
+        .build();
+
+    iggy_consumer.init().await?;
+    Ok(iggy_consumer)
 }
 
 /// looks up the reply's signature against the pending-request registry
@@ -215,7 +215,7 @@ fn dispatch_back_message(pending: &DashMap<String, PendingRequestEntry>, connect
         return;
     }
 
-    // nothing sends a later reply for its signature (tasks can't report completion yet)
+    // a final reply (or an error) ends the request
     if let Some(sig) = &m.signature
         && let Some((signature, entry)) = pending.remove(sig)
     {
@@ -273,7 +273,9 @@ pub(crate) async fn init_iggy(stream: &str, back_topic: &str, iggy_client: &Iggy
     match APP.config.get(GATE_TOPICS_MAP) {
         Some(t) => {
             for (service, topic_cfg) in t.as_object().expect("invalid topic configuration").iter() {
-                let cfg: TopicConfig = topic_cfg.try_into()?;
+                let cfg: TopicConfig = topic_cfg
+                    .try_into()
+                    .map_err(|e| format!("{GATE_TOPICS_MAP}/{service}: {e}"))?;
                 for topic_type in &cfg.topic_types {
                     let topic = format!("{}-{}-{}", service, topic_type, VERSION);
                     let topic_key = format!("{service}/{topic_type}");
@@ -333,26 +335,23 @@ pub(crate) async fn publish_to_service(
     let mut headers = std::collections::BTreeMap::new();
 
     headers.insert(
-        HeaderKey::from_str(IGGY_HEADER_SIGNATURE)?,
+        header_keys::SIGNATURE.clone(),
         HeaderValue::from_str(signature)?,
     );
 
     if let Some(key) = api_key {
         headers.insert(
-            HeaderKey::from_str(IGGY_HEADER_API_KEY)?,
+            header_keys::API_KEY.clone(),
             HeaderValue::from_str(&key.to_string())?,
         );
     }
 
     headers.insert(
-        HeaderKey::from_str(IGGY_HEADER_HTTP_METHOD)?,
+        header_keys::HTTP_METHOD.clone(),
         HeaderValue::from_str("WS")?,
     );
 
-    headers.insert(
-        HeaderKey::from_str(IGGY_HEADER_HTTP_PATH)?,
-        HeaderValue::from_str(uri)?,
-    );
+    headers.insert(header_keys::HTTP_PATH.clone(), HeaderValue::from_str(uri)?);
 
     let bytes = Bytes::copy_from_slice(body);
     let message = IggyMessage::builder()

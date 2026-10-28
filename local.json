@@ -15,7 +15,9 @@
     "authServiceUrl": "http://localhost:9001",
     "rootKey": "01a01500-98d5-71fc-9038-71acb78d61c4",
     "heartbeatIntervalSecs": 5,
-    "clientTimeoutSecs": 10
+    "clientTimeoutSecs": 10,
+    "maxInFlightFrames": 64,
+    "maxPendingRequests": 300
   },
   "iggy": {
     "url": "iggy://iggy:Secret123!@localhost:8081",

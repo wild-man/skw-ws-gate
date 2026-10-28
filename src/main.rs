@@ -35,8 +35,8 @@ async fn main() -> Result<(), AppError> {
     // rather than lazily on the first websocket auth/heartbeat
     info!("using auth service url: {}", CFG_AUTH_SERVICE_URL.as_str());
     info!(
-        "heartbeat interval: {:?}, client timeout: {:?}",
-        *CFG_HEARTBEAT_INTERVAL, *CFG_CLIENT_TIMEOUT
+        "heartbeat interval: {:?}, client timeout: {:?}, max in-flight frames: {}, max pending requests: {}",
+        *CFG_HEARTBEAT_INTERVAL, *CFG_CLIENT_TIMEOUT, *CFG_MAX_INFLIGHT_FRAMES, *CFG_MAX_PENDING_REQUESTS
     );
 
     rustls::crypto::aws_lc_rs::default_provider()

@@ -1,4 +1,11 @@
-use std::{collections::HashMap, str::FromStr, sync::Arc};
+use std::{
+    collections::HashMap,
+    str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use dashmap::DashMap;
 
@@ -47,6 +54,26 @@ pub(crate) enum WsOutbound {
         signature: String,
         uri: String,
     },
+    /// send this Close frame, then close the socket (a client ignoring the Close can't keep it open)
+    Close(ntex::web::ws::CloseReason),
+}
+
+/// One pending request counted in its connection's `WsState::pending` for as long as the
+/// entry lives: every removal path (reply, timeout watchdog, publish error) drops it, which
+/// decrements the count, so it can't drift.
+pub(crate) struct PendingSlot(Arc<AtomicUsize>);
+
+impl PendingSlot {
+    pub(crate) fn new(pending: &Arc<AtomicUsize>) -> Self {
+        pending.fetch_add(1, Ordering::Relaxed);
+        Self(pending.clone())
+    }
+}
+
+impl Drop for PendingSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 pub(crate) struct PendingRequestEntry {
@@ -57,6 +84,8 @@ pub(crate) struct PendingRequestEntry {
     pub reply_id: String,
     pub uri: String,
     pub ts_gate_published: DateTime<Utc>,
+    /// counts this request against its connection's `/service/maxPendingRequests`
+    pub _slot: PendingSlot,
 }
 
 pub(crate) struct ConnectionEntry {
@@ -362,4 +391,21 @@ pub(crate) async fn publish_to_service(
     producer.send_one(message).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_slot_counts_while_alive() {
+        let pending = Arc::new(AtomicUsize::new(0));
+        let a = PendingSlot::new(&pending);
+        let b = PendingSlot::new(&pending);
+        assert_eq!(pending.load(Ordering::Relaxed), 2);
+        drop(a);
+        assert_eq!(pending.load(Ordering::Relaxed), 1);
+        drop(b);
+        assert_eq!(pending.load(Ordering::Relaxed), 0);
+    }
 }

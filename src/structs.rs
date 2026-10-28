@@ -1,3 +1,5 @@
+use std::net::SocketAddr;
+use std::sync::{Arc, atomic::AtomicUsize};
 use std::time::Instant;
 
 use skw_lib_shared::prelude::{jsonrpc::JsonRpcGateHttpRequest, serde::*, uuid::Uuid};
@@ -91,6 +93,20 @@ pub(crate) struct WsState {
     /// minted once per connection; used to address this connection in the
     /// gate's connections registry (registered only after Authorize)
     pub connection_id: Uuid,
+    /// requests of this connection waiting for their reply (see `gate::PendingSlot`)
+    pub pending: Arc<AtomicUsize>,
+    /// client's address as seen by the gate's socket (a proxy in front would show its own)
+    pub peer_addr: Option<SocketAddr>,
+}
+
+impl WsState {
+    /// `"<connection id> (<peer addr>)"`, for log lines about this connection
+    pub(crate) fn describe(&self) -> String {
+        match self.peer_addr {
+            Some(addr) => format!("{} ({addr})", self.connection_id),
+            None => format!("{} (unknown peer)", self.connection_id),
+        }
+    }
 }
 
 #[cfg(test)]

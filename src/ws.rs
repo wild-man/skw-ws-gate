@@ -1,9 +1,17 @@
-use std::{cell::RefCell, rc::Rc, time::Instant};
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Instant,
+};
 
 use dashmap::mapref::entry::Entry;
 
 use ntex::service::{Service, fn_factory_with_config, fn_shutdown};
-use ntex::util::Bytes;
+use ntex::util::{Bytes, inflight::InFlightService};
 use ntex::web;
 use ntex::{chain, fn_service};
 use ntex::{channel::oneshot, rt, time};
@@ -11,9 +19,9 @@ use ntex::{channel::oneshot, rt, time};
 use skw_lib_shared::AppError;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::cfg::{CFG_CLIENT_TIMEOUT, CFG_HEARTBEAT_INTERVAL};
+use crate::cfg::{CFG_CLIENT_TIMEOUT, CFG_HEARTBEAT_INTERVAL, CFG_MAX_INFLIGHT_FRAMES, CFG_MAX_PENDING_REQUESTS};
 use crate::crypto::{check_authorize, verify_signature};
-use crate::gate::{ConnectionEntry, PendingRequestEntry, WsGateState, WsOutbound, publish_to_service};
+use crate::gate::{ConnectionEntry, PendingRequestEntry, PendingSlot, WsGateState, WsOutbound, publish_to_service};
 use crate::structs::{AuthState, WsMethod, WsRequest, WsState};
 use skw_lib_shared::prelude::{
     axum::StatusCode,
@@ -57,17 +65,38 @@ pub(crate) async fn handle_frame(
         // validate the frame is valid UTF-8 *and* deserializes into our expected shape
         web::ws::Frame::Text(text) => match refresh_hb(&state, serde_json::from_slice::<WsRequest>(&text)) {
             Ok(req) => {
+                // checked before the signature check: a client over the limit costs no more work.
+                // Check and count (in `dispatch_request`) run before the first `.await`, and a
+                // connection's frames share one worker thread, so the limit can't be overshot
+                let pending = state.borrow().pending.clone();
+                if pending.load(Ordering::Relaxed) >= *CFG_MAX_PENDING_REQUESTS {
+                    warn!(
+                        "connection {} has {} pending requests, closing",
+                        state.borrow().describe(),
+                        *CFG_MAX_PENDING_REQUESTS
+                    );
+                    return Ok(close_connection(&outbound_tx, "Too many pending requests"));
+                }
+
                 // public/open topics need neither authorization nor a valid signature (like
                 // gates/api); `Signature` is then only the client's request id, echoed in the reply
                 if is_unsigned_topic(req.uri.as_deref()) {
                     let rnd_signature = skw_random_signature();
-                    return Ok(dispatch_request(&gate_state, &outbound_tx, None, rnd_signature, req).await);
+                    return Ok(dispatch_request(
+                        &gate_state,
+                        &outbound_tx,
+                        &pending,
+                        None,
+                        &rnd_signature,
+                        req,
+                    )
+                    .await);
                 }
 
                 let auth = state.borrow().auth;
 
                 match auth {
-                    AuthState::Authorizing => unauthorized_close(),
+                    AuthState::Authorizing => unauthorized_close(&outbound_tx),
 
                     AuthState::Pending => {
                         // claim the single authorization attempt synchronously,
@@ -80,10 +109,12 @@ pub(crate) async fn handle_frame(
                                 // an old Authorize frame must not open a session: it fails like bad credentials
                                 Ok(_) if skw_is_outdated(req.data.ts) => {
                                     warn!(
-                                        "outdated Authorize frame, Ts: {}; api key: {}",
-                                        req.data.ts, api_key
+                                        "outdated Authorize frame, Ts: {}; api key: {}; connection {}",
+                                        req.data.ts,
+                                        api_key,
+                                        state.borrow().describe()
                                     );
-                                    unauthorized_close()
+                                    unauthorized_close(&outbound_tx)
                                 }
                                 Ok(public_key) => {
                                     let connection_id = {
@@ -111,9 +142,9 @@ pub(crate) async fn handle_frame(
                                     // debug!("{:?}", state);
                                     Some(web::ws::Message::Text(reply.into()))
                                 }
-                                Err(_) => unauthorized_close(),
+                                Err(_) => unauthorized_close(&outbound_tx),
                             },
-                            Err(_) => unauthorized_close(),
+                            Err(_) => unauthorized_close(&outbound_tx),
                         }
                     }
                     AuthState::Authorized => {
@@ -142,18 +173,30 @@ pub(crate) async fn handle_frame(
                             Ok(()) => {
                                 // signature is verified and unforgeable, so it doubles as the correlation id
                                 let signature = req.signature.clone();
-                                dispatch_request(&gate_state, &outbound_tx, api_key, signature, req).await
+                                dispatch_request(
+                                    &gate_state,
+                                    &outbound_tx,
+                                    &pending,
+                                    api_key,
+                                    &signature,
+                                    req,
+                                )
+                                .await
                             }
-                            Err(_) => unauthorized_close(),
+                            Err(_) => unauthorized_close(&outbound_tx),
                         }
                     }
                 }
             }
             Err(err) => {
-                warn!("invalid message received. error: {}", err);
+                warn!(
+                    "invalid message from connection {}: {}",
+                    state.borrow().describe(),
+                    err
+                );
                 // let reply = serde_json::json!({ "error": err.to_string() }).to_string();
                 // Some(web::ws::Message::Text(reply.into()));
-                unauthorized_close()
+                unauthorized_close(&outbound_tx)
             }
         },
 
@@ -182,8 +225,9 @@ pub(crate) async fn handle_frame(
 async fn dispatch_request(
     gate_state: &WsGateState,
     outbound_tx: &UnboundedSender<WsOutbound>,
+    pending: &Arc<AtomicUsize>,
     api_key: Option<Uuid>,
-    signature: String,
+    signature: &str,
     req: WsRequest,
 ) -> Option<web::ws::Message> {
     let uri = req.uri.clone().unwrap_or_default();
@@ -210,7 +254,7 @@ async fn dispatch_request(
 
     // a signed request's signature is its key: a duplicate still in flight would overwrite the
     // first entry and run the request twice, so it is refused until the first one is answered
-    match gate_state.pending_requests.entry(signature.clone()) {
+    match gate_state.pending_requests.entry(signature.to_string()) {
         Entry::Occupied(_) => {
             warn!("request already pending, signature: {}", signature);
             return error_message(
@@ -225,6 +269,7 @@ async fn dispatch_request(
                 reply_id: req.signature.clone(),
                 uri: uri.clone(),
                 ts_gate_published: Utc::now(),
+                _slot: PendingSlot::new(pending),
             });
         }
     }
@@ -233,15 +278,12 @@ async fn dispatch_request(
     // entry (no reply arrived in time), remove it ourselves and notify the
     // client — mirrors gates/api's 30s BACK_MESSAGE_TIMEOUT / 504 behavior
     let pending_requests = gate_state.pending_requests.clone();
-    let signature_for_timeout = signature.clone();
+    let signature_for_timeout = signature.to_string();
 
     tokio::spawn(async move {
         tokio::time::sleep(BACK_MESSAGE_TIMEOUT).await;
-        if let Some((signature, entry)) = pending_requests.remove(&signature_for_timeout) {
-            warn!(
-                "timeout waiting for backend response signature: {}",
-                signature
-            );
+        if let Some((s, entry)) = pending_requests.remove(&signature_for_timeout) {
+            warn!("timeout waiting for backend response signature: {}", s);
             let _ = entry.outbound.send(WsOutbound::Timeout {
                 signature: entry.reply_id,
                 uri: uri.clone(),
@@ -253,14 +295,14 @@ async fn dispatch_request(
     if let Err(e) = publish_to_service(
         producer,
         api_key.as_ref(),
-        &signature,
+        signature,
         &uri,
         req.data.raw_str().as_bytes(),
     )
     .await
     {
         error!("publish to service error: {}", e);
-        gate_state.pending_requests.remove(&signature);
+        gate_state.pending_requests.remove(signature);
         return error_message(
             &req.signature,
             "internal error",
@@ -282,6 +324,7 @@ fn is_unsigned_topic(uri: Option<&str>) -> bool {
 pub(crate) async fn ws_service(
     sink: web::ws::WsSink,
     gate_state: WsGateState,
+    peer_addr: Option<std::net::SocketAddr>,
 ) -> Result<impl Service<web::ws::Frame, Response = Option<web::ws::Message>, Error = AppError>, web::Error> {
     let connection_id = Uuid::now_v7();
 
@@ -291,7 +334,10 @@ pub(crate) async fn ws_service(
         public_key: None,
         api_key: None,
         connection_id,
+        pending: Arc::new(AtomicUsize::new(0)),
+        peer_addr,
     }));
+    debug!("ws connection {} opened", state.borrow().describe());
 
     // outbound channel: the only Send-safe handle to this connection reachable
     // from other tasks (WsSink itself is !Send, thread-affine to this
@@ -304,16 +350,20 @@ pub(crate) async fn ws_service(
     // start heartbeat + outbound-delivery task
     rt::spawn(heartbeat(state.clone(), sink, rx, outbound_rx));
 
-    // handler service for incoming websockets frames
+    // handler service for incoming websockets frames; at most CFG_MAX_INFLIGHT_FRAMES at once,
+    // so one client's burst can't hold this worker (and its other connections) for long
     let gate_state_frames = gate_state.clone();
-    let service = fn_service(move |frame| {
-        handle_frame(
-            state.clone(),
-            gate_state_frames.clone(),
-            outbound_tx.clone(),
-            frame,
-        )
-    });
+    let service = InFlightService::new(
+        *CFG_MAX_INFLIGHT_FRAMES,
+        fn_service(move |frame| {
+            handle_frame(
+                state.clone(),
+                gate_state_frames.clone(),
+                outbound_tx.clone(),
+                frame,
+            )
+        }),
+    );
 
     // handler service for shutdown notification: stops the heartbeat task and
     // deregisters this connection from the gate's connections registry
@@ -349,7 +399,7 @@ pub(crate) async fn heartbeat(
                 // check client heartbeats
                 if Instant::now().duration_since(state.borrow().hb) > *CFG_CLIENT_TIMEOUT {
                     // heartbeat timed out
-                    warn!("Websocket Client heartbeat failed, disconnecting!");
+                    warn!("ws client {} silent for {:?}, disconnecting", state.borrow().describe(), *CFG_CLIENT_TIMEOUT);
                     sink.io().terminate();
                     return;
                 }
@@ -357,21 +407,28 @@ pub(crate) async fn heartbeat(
                 // send ping
                 debug!("ws ping -> connection {}", state.borrow().connection_id);
                 if sink.send(web::ws::Message::Ping(Bytes::default())).await.is_err() {
-                    warn!("Websocket Client heartbeat failed, disconnecting!");
+                    warn!("ws ping to {} failed, disconnecting", state.borrow().describe());
                     sink.io().terminate();
                     return;
                 }
             }
             _ = &mut rx => {
-                warn!("Connection is dropped, stop heartbeat task");
-                sink.io().terminate();
+                debug!("ws connection {} closed, stop heartbeat task", state.borrow().describe());
+                sink.io().close();
                 return;
             }
             // once all senders are dropped `recv()` yields `None` at once on every poll; a failed
             // pattern disables this branch instead of spinning, teardown is up to the other branches
             Some(msg) = outbound_rx.recv() => {
+                let close = matches!(msg, WsOutbound::Close(_));
                 if sink.send(build_ws_message(msg)).await.is_err() {
                     sink.io().terminate();
+                    return;
+                }
+                // after our own Close, close the socket ourselves (flushing the Close first):
+                // nothing else would if the client never echoes it
+                if close {
+                    sink.io().close();
                     return;
                 }
             }
@@ -381,6 +438,7 @@ pub(crate) async fn heartbeat(
 
 fn build_ws_message(outbound: WsOutbound) -> web::ws::Message {
     let json = match outbound {
+        WsOutbound::Close(reason) => return web::ws::Message::Close(Some(reason)),
         WsOutbound::Reply {
             signature,
             payload,
@@ -423,12 +481,13 @@ fn build_ws_message(outbound: WsOutbound) -> web::ws::Message {
 /// do websocket handshake and start web sockets service
 pub(crate) async fn ws_index(req: web::HttpRequest, state: web::types::State<WsGateState>) -> Result<web::HttpResponse, web::Error> {
     let gate_state = state.get_ref().clone();
+    let peer_addr = req.peer_addr();
     web::ws::start(
         req,
         None::<String>,
         fn_factory_with_config(move |sink| {
             let gate_state = gate_state.clone();
-            async move { ws_service(sink, gate_state).await }
+            async move { ws_service(sink, gate_state, peer_addr).await }
         }),
     )
     .await
@@ -436,11 +495,19 @@ pub(crate) async fn ws_index(req: web::HttpRequest, state: web::types::State<WsG
 
 // connection is not authorized until the client's first message
 // successfully authorizes it; a bad/failed attempt closes the connection.
-pub(crate) fn unauthorized_close() -> Option<web::ws::Message> {
-    Some(web::ws::Message::Close(Some(web::ws::CloseReason {
+pub(crate) fn unauthorized_close(outbound_tx: &UnboundedSender<WsOutbound>) -> Option<web::ws::Message> {
+    close_connection(outbound_tx, "Unauthorized") // @todo move to some Payload struct
+}
+
+/// Closes the connection with policy code 1008 and `reason`. Goes through the heartbeat task,
+/// which sends the Close frame and then closes the socket: returning the Close as this frame's
+/// response would only write it, leaving the socket open for a client that never echoes it.
+pub(crate) fn close_connection(outbound_tx: &UnboundedSender<WsOutbound>, reason: &str) -> Option<web::ws::Message> {
+    let _ = outbound_tx.send(WsOutbound::Close(web::ws::CloseReason {
         code: web::ws::CloseCode::Policy,
-        description: Some("Unauthorized".into()), // @todo move to some Payload struct
-    })))
+        description: Some(reason.into()),
+    }));
+    None
 }
 
 // non-terminal error reply for a signed-but-unroutable/unpublishable
@@ -458,6 +525,27 @@ fn error_message(signature: &str, reason: &str, code: StatusCode) -> Option<web:
 mod tests {
     use super::*;
     use skw_lib_shared::prelude::jsonrpc::{SkwServiceHttpError, SkwServiceStatus};
+
+    /// the Close goes through the heartbeat task (which then closes the socket), not as the
+    /// frame's response
+    #[test]
+    fn close_connection_queues_policy_close() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(close_connection(&tx, "Too many pending requests").is_none());
+
+        let Ok(WsOutbound::Close(reason)) = rx.try_recv() else {
+            panic!("no Close queued");
+        };
+        assert_eq!(reason.code, web::ws::CloseCode::Policy);
+        assert_eq!(
+            reason.description.as_deref(),
+            Some("Too many pending requests")
+        );
+        assert!(matches!(
+            build_ws_message(WsOutbound::Close(reason)),
+            web::ws::Message::Close(Some(_))
+        ));
+    }
 
     #[test]
     fn unsigned_topics() {

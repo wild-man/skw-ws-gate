@@ -1,5 +1,6 @@
 use std::{
     cell::RefCell,
+    net::SocketAddr,
     rc::Rc,
     sync::{
         Arc,
@@ -10,11 +11,20 @@ use std::{
 
 use dashmap::mapref::entry::Entry;
 
-use ntex::service::{Service, fn_factory_with_config, fn_shutdown};
-use ntex::util::{Bytes, inflight::InFlightService};
-use ntex::web;
-use ntex::{chain, fn_service};
-use ntex::{channel::oneshot, rt, time};
+use ntex::{
+    chain,
+    channel::oneshot,
+    fn_service, rt,
+    service::{Service, fn_factory_with_config, fn_shutdown},
+    time,
+    util::{Bytes, inflight::InFlightService},
+    web,
+    web::ws::start,
+    ws::CloseCode,
+    ws::CloseReason,
+    ws::Message,
+    ws::{Frame, WsSink},
+};
 
 use skw_lib_shared::AppError;
 use tokio::sync::mpsc::UnboundedSender;
@@ -45,25 +55,25 @@ pub(crate) async fn handle_frame(
     state: Rc<RefCell<WsState>>,
     gate_state: WsGateState,
     outbound_tx: UnboundedSender<WsOutbound>,
-    frame: web::ws::Frame,
-) -> Result<Option<web::ws::Message>, AppError> {
+    frame: Frame,
+) -> Result<Option<Message>, AppError> {
     let item = match frame {
         // update heartbeat: any responsive client stays connected, authorized or not,
         // since public/open requests need no authorization
-        web::ws::Frame::Ping(msg) => {
+        Frame::Ping(msg) => {
             trace!("ws ping <- connection {}", state.borrow().connection_id);
             state.borrow_mut().hb = Instant::now();
-            Some(web::ws::Message::Pong(msg))
+            Some(Message::Pong(msg))
         }
 
-        web::ws::Frame::Pong(_) => {
+        Frame::Pong(_) => {
             trace!("ws pong <- connection {}", state.borrow().connection_id);
             state.borrow_mut().hb = Instant::now();
             None
         }
 
         // validate the frame is valid UTF-8 *and* deserializes into our expected shape
-        web::ws::Frame::Text(text) => match refresh_hb(&state, serde_json::from_slice::<WsRequest>(&text)) {
+        Frame::Text(text) => match refresh_hb(&state, serde_json::from_slice::<WsRequest>(&text)) {
             Ok(req) => {
                 // checked before the signature check: a client over the limit costs no more work.
                 // Check and count (in `dispatch_request`) run before the first `.await`, and a
@@ -140,7 +150,7 @@ pub(crate) async fn handle_frame(
                                     let reply = serde_json::json!({ "Authorized": true }).to_string();
 
                                     // debug!("{:?}", state);
-                                    Some(web::ws::Message::Text(reply.into()))
+                                    Some(Message::Text(reply.into()))
                                 }
                                 Err(_) => unauthorized_close(&outbound_tx),
                             },
@@ -194,17 +204,13 @@ pub(crate) async fn handle_frame(
                     state.borrow().describe(),
                     err
                 );
-                // let reply = serde_json::json!({ "error": err.to_string() }).to_string();
-                // Some(web::ws::Message::Text(reply.into()));
+
                 unauthorized_close(&outbound_tx)
             }
         },
 
         // close connection
-        web::ws::Frame::Close(reason) => Some(web::ws::Message::Close(reason)),
-
-        // skip binary messages
-        // web::ws::Frame::Binary(bin) => Some(web::ws::Message::Binary(bin)),
+        Frame::Close(reason) => Some(Message::Close(reason)),
 
         // ignore other frames
         _ => None,
@@ -229,7 +235,7 @@ async fn dispatch_request(
     api_key: Option<Uuid>,
     signature: &str,
     req: WsRequest,
-) -> Option<web::ws::Message> {
+) -> Option<Message> {
     let uri = req.uri.clone().unwrap_or_default();
     let mut slug_split = uri.trim_matches('/').split("/");
 
@@ -322,10 +328,10 @@ fn is_unsigned_topic(uri: Option<&str>) -> bool {
 
 /// WebSockets service factory
 pub(crate) async fn ws_service(
-    sink: web::ws::WsSink,
+    sink: WsSink,
     gate_state: WsGateState,
-    peer_addr: Option<std::net::SocketAddr>,
-) -> Result<impl Service<web::ws::Frame, Response = Option<web::ws::Message>, Error = AppError>, web::Error> {
+    peer_addr: Option<SocketAddr>,
+) -> Result<impl Service<Frame, Response = Option<Message>, Error = AppError>, web::Error> {
     let connection_id = Uuid::now_v7();
 
     let state = Rc::new(RefCell::new(WsState {
@@ -385,7 +391,7 @@ pub(crate) async fn ws_service(
 /// `!Send`/`!Sync`, thread-affine to this connection's worker thread).
 pub(crate) async fn heartbeat(
     state: Rc<RefCell<WsState>>,
-    sink: web::ws::WsSink,
+    sink: WsSink,
     mut rx: oneshot::Receiver<()>,
     mut outbound_rx: tokio::sync::mpsc::UnboundedReceiver<WsOutbound>,
 ) {
@@ -406,7 +412,7 @@ pub(crate) async fn heartbeat(
 
                 // send ping
                 debug!("ws ping -> connection {}", state.borrow().connection_id);
-                if sink.send(web::ws::Message::Ping(Bytes::default())).await.is_err() {
+                if sink.send(Message::Ping(Bytes::default())).await.is_err() {
                     warn!("ws ping to {} failed, disconnecting", state.borrow().describe());
                     sink.io().terminate();
                     return;
@@ -436,9 +442,9 @@ pub(crate) async fn heartbeat(
     }
 }
 
-fn build_ws_message(outbound: WsOutbound) -> web::ws::Message {
+fn build_ws_message(outbound: WsOutbound) -> Message {
     let json = match outbound {
-        WsOutbound::Close(reason) => return web::ws::Message::Close(Some(reason)),
+        WsOutbound::Close(reason) => return Message::Close(Some(reason)),
         WsOutbound::Reply {
             signature,
             payload,
@@ -475,14 +481,14 @@ fn build_ws_message(outbound: WsOutbound) -> web::ws::Message {
             })
         }
     };
-    web::ws::Message::Text(json.to_string().into())
+    Message::Text(json.to_string().into())
 }
 
 /// do websocket handshake and start web sockets service
 pub(crate) async fn ws_index(req: web::HttpRequest, state: web::types::State<WsGateState>) -> Result<web::HttpResponse, web::Error> {
     let gate_state = state.get_ref().clone();
     let peer_addr = req.peer_addr();
-    web::ws::start(
+    start(
         req,
         None::<String>,
         fn_factory_with_config(move |sink| {
@@ -495,16 +501,16 @@ pub(crate) async fn ws_index(req: web::HttpRequest, state: web::types::State<WsG
 
 // connection is not authorized until the client's first message
 // successfully authorizes it; a bad/failed attempt closes the connection.
-pub(crate) fn unauthorized_close(outbound_tx: &UnboundedSender<WsOutbound>) -> Option<web::ws::Message> {
+pub(crate) fn unauthorized_close(outbound_tx: &UnboundedSender<WsOutbound>) -> Option<Message> {
     close_connection(outbound_tx, "Unauthorized") // @todo move to some Payload struct
 }
 
 /// Closes the connection with policy code 1008 and `reason`. Goes through the heartbeat task,
 /// which sends the Close frame and then closes the socket: returning the Close as this frame's
 /// response would only write it, leaving the socket open for a client that never echoes it.
-pub(crate) fn close_connection(outbound_tx: &UnboundedSender<WsOutbound>, reason: &str) -> Option<web::ws::Message> {
-    let _ = outbound_tx.send(WsOutbound::Close(web::ws::CloseReason {
-        code: web::ws::CloseCode::Policy,
+pub(crate) fn close_connection(outbound_tx: &UnboundedSender<WsOutbound>, reason: &str) -> Option<Message> {
+    let _ = outbound_tx.send(WsOutbound::Close(CloseReason {
+        code: CloseCode::Policy,
         description: Some(reason.into()),
     }));
     None
@@ -513,8 +519,8 @@ pub(crate) fn close_connection(outbound_tx: &UnboundedSender<WsOutbound>, reason
 // non-terminal error reply for a signed-but-unroutable/unpublishable
 // request; the connection stays open for further requests.
 // `code` mirrors the HTTP status gates/api answers in the same situation.
-fn error_message(signature: &str, reason: &str, code: StatusCode) -> Option<web::ws::Message> {
-    Some(web::ws::Message::Text(
+fn error_message(signature: &str, reason: &str, code: StatusCode) -> Option<Message> {
+    Some(Message::Text(
         serde_json::json!({ "Signature": signature, "ErrorMsg": reason, "ErrCode": code.as_u16() })
             .to_string()
             .into(),
@@ -536,14 +542,14 @@ mod tests {
         let Ok(WsOutbound::Close(reason)) = rx.try_recv() else {
             panic!("no Close queued");
         };
-        assert_eq!(reason.code, web::ws::CloseCode::Policy);
+        assert_eq!(reason.code, CloseCode::Policy);
         assert_eq!(
             reason.description.as_deref(),
             Some("Too many pending requests")
         );
         assert!(matches!(
             build_ws_message(WsOutbound::Close(reason)),
-            web::ws::Message::Close(Some(_))
+            Message::Close(Some(_))
         ));
     }
 
@@ -560,7 +566,7 @@ mod tests {
     }
 
     fn reply_json(outbound: WsOutbound) -> serde_json::Value {
-        let web::ws::Message::Text(text) = build_ws_message(outbound) else {
+        let Message::Text(text) = build_ws_message(outbound) else {
             panic!("expected a text frame");
         };
         serde_json::from_str(&text).unwrap()

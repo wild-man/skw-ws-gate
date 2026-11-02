@@ -4,7 +4,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicI64, AtomicUsize, Ordering},
     },
     time::Instant,
 };
@@ -275,6 +275,7 @@ async fn dispatch_request(
                 reply_id: req.signature.clone(),
                 uri: uri.clone(),
                 ts_gate_published: Utc::now(),
+                deadline_ms: AtomicI64::new(Utc::now().timestamp_millis() + BACK_MESSAGE_TIMEOUT.as_millis() as i64),
                 _slot: PendingSlot::new(pending),
             });
         }
@@ -286,14 +287,32 @@ async fn dispatch_request(
     let pending_requests = gate_state.pending_requests.clone();
     let signature_for_timeout = signature.to_string();
 
+    // (a provisional reply moves the deadline, so the watchdog sleeps again until the new one)
     tokio::spawn(async move {
-        tokio::time::sleep(BACK_MESSAGE_TIMEOUT).await;
-        if let Some((s, entry)) = pending_requests.remove(&signature_for_timeout) {
-            warn!("timeout waiting for backend response signature: {}", s);
-            let _ = entry.outbound.send(WsOutbound::Timeout {
-                signature: entry.reply_id,
-                uri: uri.clone(),
-            });
+        loop {
+            // the map guard must not be held across the sleep
+            let wait_ms = match pending_requests.get(&signature_for_timeout) {
+                Some(entry) => entry.deadline_ms() - Utc::now().timestamp_millis(),
+                None => return,
+            };
+            if wait_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(wait_ms as u64)).await;
+                continue;
+            }
+            match pending_requests.remove_if(&signature_for_timeout, |_, e| {
+                e.deadline_ms() <= Utc::now().timestamp_millis()
+            }) {
+                Some((s, entry)) => {
+                    warn!("timeout waiting for backend response signature: {}", s);
+                    let _ = entry.outbound.send(WsOutbound::Timeout {
+                        signature: entry.reply_id,
+                        uri: uri.clone(),
+                    });
+                    return;
+                }
+                // gone (answered) or extended meanwhile: the next round finds out which
+                None => continue,
+            }
         }
     });
 

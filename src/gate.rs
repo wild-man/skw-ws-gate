@@ -3,7 +3,7 @@ use std::{
     str::FromStr,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicI64, AtomicUsize, Ordering},
     },
 };
 
@@ -84,8 +84,24 @@ pub(crate) struct PendingRequestEntry {
     pub reply_id: String,
     pub uri: String,
     pub ts_gate_published: DateTime<Utc>,
+    /// when the timeout watchdog gives up on this request (unix millis); a provisional reply
+    /// moves it to `/service/provisionalReplyTimeoutSecs` from then
+    pub deadline_ms: AtomicI64,
     /// counts this request against its connection's `/service/maxPendingRequests`
     pub _slot: PendingSlot,
+}
+
+impl PendingRequestEntry {
+    pub fn deadline_ms(&self) -> i64 {
+        self.deadline_ms.load(Ordering::Relaxed)
+    }
+
+    pub fn extend_deadline(&self, by: std::time::Duration) {
+        let deadline = Utc::now()
+            .timestamp_millis()
+            .saturating_add(i64::try_from(by.as_millis()).unwrap_or(i64::MAX));
+        self.deadline_ms.fetch_max(deadline, Ordering::Relaxed);
+    }
 }
 
 pub(crate) struct ConnectionEntry {
@@ -235,6 +251,7 @@ fn dispatch_back_message(pending: &DashMap<String, PendingRequestEntry>, connect
             m.service_status,
             Utc::now() - entry.ts_gate_published
         );
+        entry.extend_deadline(*crate::cfg::CFG_PROVISIONAL_REPLY_TIMEOUT);
         let _ = entry.outbound.send(WsOutbound::Reply {
             signature: entry.reply_id.clone(),
             payload: m.payload,

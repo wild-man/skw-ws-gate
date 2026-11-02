@@ -47,6 +47,20 @@ pub(crate) static CFG_MAX_PENDING_REQUESTS: LazyLock<usize> = LazyLock::new(|| {
         .unwrap_or(300)
 });
 
+/// How long a request may still wait for its final reply after a provisional one (Created/Accepted):
+/// that work (e.g. an LLM answer) takes longer than the usual `BACK_MESSAGE_TIMEOUT`
+pub(crate) static CFG_PROVISIONAL_REPLY_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
+    APP.config
+        .get("/service/provisionalReplyTimeoutSecs")
+        .map(|v| {
+            v.as_u64()
+                .filter(|&n| n > 0)
+                .expect("invalid /service/provisionalReplyTimeoutSecs")
+        })
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(300))
+});
+
 pub(crate) static CFG_AUTH_SERVICE_URL: LazyLock<String> = LazyLock::new(|| {
     let auth_service_url = APP
         .config

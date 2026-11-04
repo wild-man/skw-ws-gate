@@ -17,7 +17,7 @@ use ntex::{
     fn_service, rt,
     service::{Service, fn_factory_with_config, fn_shutdown},
     time,
-    util::{Bytes, inflight::InFlightService},
+    util::{ByteString, Bytes, inflight::InFlightService},
     web,
     web::ws::start,
     ws::CloseCode,
@@ -26,18 +26,22 @@ use ntex::{
     ws::{Frame, WsSink},
 };
 
-use skw_lib_shared::AppError;
+use serde::{Serialize, Serializer};
+use serde_json::value::RawValue;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::cfg::{CFG_CLIENT_TIMEOUT, CFG_HEARTBEAT_INTERVAL, CFG_MAX_INFLIGHT_FRAMES, CFG_MAX_PENDING_REQUESTS, CFG_MAX_SESSIONS_PER_TOKEN};
 use crate::crypto::{check_authorize, verify_signature};
 use crate::gate::{ConnectionEntry, PendingRequestEntry, PendingSlot, WsGateState, WsOutbound, publish_to_service};
 use crate::structs::{AuthState, WsMethod, WsRequest, WsState};
+
+use skw_lib_shared::AppError;
 use skw_lib_shared::prelude::{
     axum::StatusCode,
     chrono::Utc,
     consts::BACK_MESSAGE_TIMEOUT,
     iggy::SkwTopicType,
+    jsonrpc::SkwServiceHttpError,
     log::*,
     tools::{skw_is_outdated, skw_random_signature},
     uuid::Uuid,
@@ -98,7 +102,7 @@ pub(crate) async fn handle_frame(
                         &pending,
                         None,
                         &rnd_signature,
-                        req,
+                        &req,
                     )
                     .await);
                 }
@@ -114,7 +118,7 @@ pub(crate) async fn handle_frame(
                         // to be dispatched concurrently.
                         state.borrow_mut().auth = AuthState::Authorizing;
 
-                        match serde_json::from_value::<WsMethod>(req.data.method.clone()) {
+                        match req.data.method::<WsMethod>() {
                             Ok(WsMethod::Authorize { api_key }) => match check_authorize(api_key, &req.signature, req.data.raw_str()).await {
                                 // an old Authorize frame must not open a session: it fails like bad credentials
                                 Ok(_) if skw_is_outdated(req.data.ts) => {
@@ -126,7 +130,7 @@ pub(crate) async fn handle_frame(
                                     );
                                     unauthorized_close(&outbound_tx)
                                 }
-                                Ok(public_key) => {
+                                Ok(verifying_key) => {
                                     // counted only for valid credentials, so unknown keys can't use up a key's sessions
                                     let Some(session) = gate_state
                                         .sessions
@@ -145,7 +149,7 @@ pub(crate) async fn handle_frame(
                                         let mut state = state.borrow_mut();
                                         state.auth = AuthState::Authorized;
                                         state.hb = Instant::now();
-                                        state.public_key = Some(public_key);
+                                        state.verifying_key = Some(verifying_key);
                                         state.api_key = Some(api_key);
                                         state.session = Some(session);
                                         state.connection_id
@@ -174,18 +178,16 @@ pub(crate) async fn handle_frame(
                     }
                     AuthState::Authorized => {
                         // set together with AuthState::Authorized, so always present here
-                        let (public_key, api_key) = {
+                        // `VerifyingKey` is `Copy`: no allocation, and no borrow held across the `.await` below
+                        let (verifying_key, api_key) = {
                             let state = state.borrow();
-                            (
-                                state
-                                    .public_key
-                                    .clone()
-                                    .expect("public_key set once Authorized"),
-                                state.api_key,
-                            )
+                            (state.verifying_key, state.api_key)
                         };
+                        let verified = verifying_key
+                            .ok_or(())
+                            .and_then(|key| verify_signature(&key, &req.signature, req.data.raw_str()).map_err(|_| ()));
 
-                        match verify_signature(&public_key, &req.signature, req.data.raw_str()) {
+                        match verified {
                             // valid key, but an old (possibly replayed) or future-dated frame:
                             // refuse the frame, keep the connection
                             Ok(()) if skw_is_outdated(req.data.ts) => {
@@ -197,14 +199,13 @@ pub(crate) async fn handle_frame(
                             }
                             Ok(()) => {
                                 // signature is verified and unforgeable, so it doubles as the correlation id
-                                let signature = req.signature.clone();
                                 dispatch_request(
                                     &gate_state,
                                     &outbound_tx,
                                     &pending,
                                     api_key,
-                                    &signature,
-                                    req,
+                                    &req.signature,
+                                    &req,
                                 )
                                 .await
                             }
@@ -249,9 +250,9 @@ async fn dispatch_request(
     pending: &Arc<AtomicUsize>,
     api_key: Option<Uuid>,
     signature: &str,
-    req: WsRequest,
+    req: &WsRequest<'_>,
 ) -> Option<Message> {
-    let uri = req.uri.clone().unwrap_or_default();
+    let uri = req.uri.as_deref().unwrap_or_default();
     let mut slug_split = uri.trim_matches('/').split("/");
 
     let slug1 = slug_split.next();
@@ -287,8 +288,8 @@ async fn dispatch_request(
         Entry::Vacant(slot) => {
             slot.insert(PendingRequestEntry {
                 outbound: outbound_tx.clone(),
-                reply_id: req.signature.clone(),
-                uri: uri.clone(),
+                reply_id: req.signature.to_string(),
+                uri: uri.to_owned(),
                 ts_gate_published: Utc::now(),
                 deadline_ms: AtomicI64::new(Utc::now().timestamp_millis() + BACK_MESSAGE_TIMEOUT.as_millis() as i64),
                 _slot: PendingSlot::new(pending),
@@ -321,7 +322,7 @@ async fn dispatch_request(
                     warn!("timeout waiting for backend response signature: {}", s);
                     let _ = entry.outbound.send(WsOutbound::Timeout {
                         signature: entry.reply_id,
-                        uri: uri.clone(),
+                        uri: entry.uri,
                     });
                     return;
                 }
@@ -331,12 +332,11 @@ async fn dispatch_request(
         }
     });
 
-    let uri = req.uri.unwrap_or_default();
     if let Err(e) = publish_to_service(
         producer,
         api_key.as_ref(),
         signature,
-        &uri,
+        uri,
         req.data.raw_str().as_bytes(),
     )
     .await
@@ -371,7 +371,7 @@ pub(crate) async fn ws_service(
     let state = Rc::new(RefCell::new(WsState {
         hb: Instant::now(),
         auth: AuthState::Pending,
-        public_key: None,
+        verifying_key: None,
         api_key: None,
         connection_id,
         pending: Arc::new(AtomicUsize::new(0)),
@@ -479,21 +479,95 @@ pub(crate) async fn heartbeat(
     }
 }
 
+/// Reply to a request: `{"Signature", "Status", "ErrorMsg", "ErrCode", "Payload"}`
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct ReplyFrame<'a> {
+    signature: &'a str,
+    status: u16,
+    error_msg: Option<AsDisplay<'a, SkwServiceHttpError>>,
+    err_code: Option<u16>,
+    payload: &'a RawValue,
+}
+
+/// Unsolicited push: `{"Push": true, "Payload"}`
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct PushFrame<'a> {
+    push: bool,
+    payload: &'a RawValue,
+}
+
+/// The gate's own error for one request: `{"Signature", "ErrorMsg", "ErrCode"}`, plus `Uri` on a timeout
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct ErrorFrame<'a> {
+    signature: &'a str,
+    error_msg: &'a str,
+    err_code: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uri: Option<&'a str>,
+}
+
+/// Serializes through `Display`, without building a `String` first.
+struct AsDisplay<'a, T>(&'a T);
+
+impl<T: std::fmt::Display> Serialize for AsDisplay<'_, T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self.0)
+    }
+}
+
+/// what a frame says when its own serialization failed (not expected: every field is a string,
+/// a number or already-valid JSON)
+const INTERNAL_ERROR_FRAME: &str = r#"{"ErrorMsg":"internal error","ErrCode":500}"#;
+
+/// The service's payload embedded as is (no parse into a `Value` tree); anything that isn't
+/// valid JSON becomes `null`.
+fn raw_payload(payload: &[u8]) -> &RawValue {
+    serde_json::from_slice(payload).unwrap_or(RawValue::NULL)
+}
+
+/// Serializes `frame` straight into one buffer of `capacity` bytes (sized so it doesn't regrow)
+/// and hands that buffer over as the text frame.
+fn text_frame<T: Serialize>(frame: &T, capacity: usize) -> Message {
+    let mut buf = Vec::with_capacity(capacity);
+    if let Err(e) = serde_json::to_writer(&mut buf, frame) {
+        error!("serializing ws frame failed: {}", e);
+        return Message::Text(ByteString::from_static(INTERNAL_ERROR_FRAME));
+    }
+    // serde_json writes valid UTF-8; checking it costs a pass, not an allocation
+    match String::from_utf8(buf) {
+        Ok(text) => Message::Text(text.into()),
+        Err(_) => Message::Text(ByteString::from_static(INTERNAL_ERROR_FRAME)),
+    }
+}
+
+/// room for the frame's field names, status and code around its variable parts
+const FRAME_OVERHEAD: usize = 96;
+
 fn build_ws_message(outbound: WsOutbound) -> Message {
-    let json = match outbound {
-        WsOutbound::Close(reason) => return Message::Close(Some(reason)),
+    match outbound {
+        WsOutbound::Close(reason) => Message::Close(Some(reason)),
         WsOutbound::Error {
             signature,
             reason,
             code,
-        } => serde_json::json!({ "Signature": signature, "ErrorMsg": reason, "ErrCode": code.as_u16() }),
+        } => text_frame(
+            &ErrorFrame {
+                signature: &signature,
+                error_msg: reason,
+                err_code: code.as_u16(),
+                uri: None,
+            },
+            signature.len() + reason.len() + FRAME_OVERHEAD,
+        ),
         WsOutbound::Reply {
             signature,
             payload,
             service_error,
             service_status,
         } => {
-            let payload: serde_json::Value = serde_json::from_slice(&payload).unwrap_or(serde_json::Value::Null);
             // HTTP status the api gate answers with: error code, 201/202 for a provisional reply
             // (request taken, its result comes later), else 200
             let status = service_error
@@ -502,28 +576,34 @@ fn build_ws_message(outbound: WsOutbound) -> Message {
                 .or(service_status.map(|s| s.status_code()))
                 .unwrap_or(StatusCode::OK);
 
-            serde_json::json!({
-                "Signature": signature,
-                "Status": status.as_u16(),
-                "ErrorMsg": service_error.as_ref().map(|e| e.to_string()),
-                "ErrCode": service_error.map(|e| e.status_code().as_u16()),
-                "Payload": payload,
-            })
+            text_frame(
+                &ReplyFrame {
+                    signature: &signature,
+                    status: status.as_u16(),
+                    error_msg: service_error.as_ref().map(AsDisplay),
+                    err_code: service_error.as_ref().map(|e| e.status_code().as_u16()),
+                    payload: raw_payload(&payload),
+                },
+                signature.len() + payload.len() + FRAME_OVERHEAD,
+            )
         }
-        WsOutbound::Push { payload } => {
-            let payload: serde_json::Value = serde_json::from_slice(&payload).unwrap_or(serde_json::Value::Null);
-            serde_json::json!({ "Push": true, "Payload": payload })
-        }
-        WsOutbound::Timeout { signature, uri } => {
-            serde_json::json!({
-                "Signature": signature,
-                "ErrorMsg": "Timeout",
-                "ErrCode": StatusCode::GATEWAY_TIMEOUT.as_u16(),
-                "Uri": uri,
-            })
-        }
-    };
-    Message::Text(json.to_string().into())
+        WsOutbound::Push { payload } => text_frame(
+            &PushFrame {
+                push: true,
+                payload: raw_payload(&payload),
+            },
+            payload.len() + FRAME_OVERHEAD,
+        ),
+        WsOutbound::Timeout { signature, uri } => text_frame(
+            &ErrorFrame {
+                signature: &signature,
+                error_msg: "Timeout",
+                err_code: StatusCode::GATEWAY_TIMEOUT.as_u16(),
+                uri: Some(&uri),
+            },
+            signature.len() + uri.len() + FRAME_OVERHEAD,
+        ),
+    }
 }
 
 /// do websocket handshake and start web sockets service
@@ -585,7 +665,7 @@ fn error_message(signature: &str, reason: &str, code: StatusCode) -> Option<Mess
 #[cfg(test)]
 mod tests {
     use super::*;
-    use skw_lib_shared::prelude::jsonrpc::{SkwServiceHttpError, SkwServiceStatus};
+    use skw_lib_shared::prelude::jsonrpc::SkwServiceStatus;
 
     /// the Close goes through the heartbeat task (which then closes the socket), not as the
     /// frame's response
@@ -630,7 +710,7 @@ mod tests {
     fn reply(service_error: Option<SkwServiceHttpError>, service_status: Option<SkwServiceStatus>) -> serde_json::Value {
         reply_json(WsOutbound::Reply {
             signature: "sig".into(),
-            payload: br#"{"Ping":{"Count":1}}"#.to_vec(),
+            payload: br#"{"Ping":{"Count":1}}"#.as_slice().into(),
             service_error,
             service_status,
         })
@@ -664,7 +744,7 @@ mod tests {
     fn invalid_payload_becomes_null() {
         let r = reply_json(WsOutbound::Reply {
             signature: "sig".into(),
-            payload: b"not json".to_vec(),
+            payload: b"not json".as_slice().into(),
             service_error: None,
             service_status: None,
         });
@@ -680,5 +760,45 @@ mod tests {
         assert_eq!(r["Signature"], "sig");
         assert_eq!(r["ErrCode"], 504);
         assert_eq!(r["ErrorMsg"], "Timeout");
+        assert_eq!(r["Uri"], "/ping/signed");
+    }
+
+    /// exact bytes: the payload is embedded verbatim (not re-serialized), `null` fields stay
+    #[test]
+    fn reply_frame_embeds_payload_verbatim() {
+        let Message::Text(text) = build_ws_message(WsOutbound::Reply {
+            signature: "sig".into(),
+            payload: br#"{"Ping": {"Count":1}}"#.as_slice().into(),
+            service_error: None,
+            service_status: None,
+        }) else {
+            panic!("expected a text frame");
+        };
+        assert_eq!(
+            &*text,
+            r#"{"Signature":"sig","Status":200,"ErrorMsg":null,"ErrCode":null,"Payload":{"Ping": {"Count":1}}}"#
+        );
+    }
+
+    #[test]
+    fn push_and_error_frames() {
+        let r = reply_json(WsOutbound::Push {
+            payload: br#"{"N":1}"#.as_slice().into(),
+        });
+        assert_eq!(
+            r,
+            serde_json::json!({ "Push": true, "Payload": { "N": 1 } })
+        );
+
+        let r = reply_json(WsOutbound::Error {
+            signature: "s\"q".into(),
+            reason: "Too many sessions",
+            code: StatusCode::FORBIDDEN,
+        });
+        // escaped, and no `Uri` key outside a timeout
+        assert_eq!(
+            r,
+            serde_json::json!({ "Signature": "s\"q", "ErrorMsg": "Too many sessions", "ErrCode": 403 })
+        );
     }
 }

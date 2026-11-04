@@ -1,54 +1,69 @@
+use std::borrow::Cow;
+use std::fmt::{Debug, Formatter};
 use std::net::SocketAddr;
 use std::sync::{Arc, atomic::AtomicUsize};
 use std::time::Instant;
 
 use crate::gate::SessionSlot;
-use skw_lib_shared::prelude::{jsonrpc::JsonRpcGateHttpRequest, serde::*, uuid::Uuid};
+use ed25519_dalek::VerifyingKey;
+use serde_json::value::RawValue;
+use skw_lib_shared::prelude::{
+    chrono::{DateTime, Utc},
+    serde::*,
+    uuid::Uuid,
+};
 
-/// A parsed value paired with the exact raw JSON text it came from. One
-/// `Deserialize` pass gives both typed field access (via `Deref`) and the
-/// original bytes needed for ed25519 signature verification —
-/// re-serializing the parsed value would only reproduce those bytes if the
-/// client's JSON codec happened to order/format fields identically to
-/// serde_json's, which isn't guaranteed. `Serialize` re-emits the stored
-/// raw text verbatim, so echoing a `Signed<T>` back reproduces exactly what
-/// the client sent, byte for byte.
-pub(crate) struct Signed<T> {
-    raw: Box<serde_json::value::RawValue>,
-    value: T,
+/// A frame's `Data`: the exact raw JSON text the client signed, borrowed from the frame
+/// buffer, plus its `Ts`. Re-serializing a parsed value would only reproduce the signed bytes
+/// if the client's JSON codec happened to order/format fields identically to serde_json's,
+/// which isn't guaranteed, so the raw text is what gets verified and forwarded. Only `Ts` is
+/// parsed (the gate needs nothing else for a signed request; services parse their own method),
+/// and nothing is copied: `Serialize` re-emits the raw text verbatim.
+pub(crate) struct SignedData<'a> {
+    raw: &'a RawValue,
+    pub ts: DateTime<Utc>,
 }
 
-impl<T> Signed<T> {
-    pub(crate) fn raw_str(&self) -> &str {
+impl<'a> SignedData<'a> {
+    pub(crate) fn raw_str(&self) -> &'a str {
         self.raw.get()
     }
-}
 
-impl<T> std::ops::Deref for Signed<T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        &self.value
+    /// Parses the method (`{"Method", "Params"}`, `Ts` ignored) the gate handles itself, e.g. `Authorize`.
+    pub(crate) fn method<T: Deserialize<'a>>(&self) -> serde_json::Result<T> {
+        serde_json::from_str(self.raw.get())
     }
 }
 
-impl<T: std::fmt::Debug> std::fmt::Debug for Signed<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.value.fmt(f)
+impl Debug for SignedData<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.raw.get())
     }
 }
 
-impl<'de, T: serde::de::DeserializeOwned> serde::Deserialize<'de> for Signed<T> {
+impl<'de: 'a, 'a> Deserialize<'de> for SignedData<'a> {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
-        let value = serde_json::from_str(raw.get()).map_err(serde::de::Error::custom)?;
-        Ok(Self { raw, value })
+        /// the one field the gate reads; the others are skipped without allocating
+        #[derive(Deserialize)]
+        struct Head {
+            #[serde(rename = "Ts")]
+            ts: DateTime<Utc>,
+        }
+
+        let raw = <&'de RawValue>::deserialize(deserializer)?;
+        // a struct would also accept a JSON array (`["<ts>"]`): `Data` must be an object
+        if !raw.get().starts_with('{') {
+            return Err(serde::de::Error::custom("Data must be a JSON object"));
+        }
+        let head: Head = serde_json::from_str(raw.get()).map_err(serde::de::Error::custom)?;
+        Ok(Self { raw, ts: head.ts })
     }
 }
 
-impl<T> Serialize for Signed<T> {
+impl Serialize for SignedData<'_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -57,13 +72,28 @@ impl<T> Serialize for Signed<T> {
     }
 }
 
-/// Client frame: `{"Signature", "Uri", "Data"}`.
+/// `Option<Cow<str>>` that borrows: serde borrows a `Cow<str>` only when it is the field type
+/// itself, inside an `Option` it would always allocate
+fn borrow_opt_str<'de, D>(deserializer: D) -> Result<Option<Cow<'de, str>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    struct Borrowed<'a>(#[serde(borrow)] Cow<'a, str>);
+    Ok(Option::<Borrowed>::deserialize(deserializer)?.map(|b| b.0))
+}
+
+/// Client frame: `{"Signature", "Uri", "Data"}`, borrowed from the frame buffer. The strings
+/// are `Cow`: borrowed unless the client escaped characters in them.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "PascalCase")]
-pub(crate) struct WsRequest {
-    pub signature: String,
-    pub uri: Option<String>,
-    pub data: Signed<JsonRpcGateHttpRequest>,
+pub(crate) struct WsRequest<'a> {
+    #[serde(borrow)]
+    pub signature: Cow<'a, str>,
+    #[serde(borrow, default, deserialize_with = "borrow_opt_str")]
+    pub uri: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    pub data: SignedData<'a>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,8 +117,9 @@ pub(crate) struct WsState {
     /// since public/open requests need no authorization.
     pub hb: Instant,
     pub auth: AuthState,
-    pub public_key: Option<String>,
-    /// set together with public_key on successful Authorize; forwarded as
+    /// parsed once on Authorize: every signed frame is verified against it
+    pub verifying_key: Option<VerifyingKey>,
+    /// set together with verifying_key on successful Authorize; forwarded as
     /// IGGY_HEADER_API_KEY on every request published for this connection
     pub api_key: Option<Uuid>,
     /// minted once per connection; used to address this connection in the
@@ -126,8 +157,23 @@ mod tests {
         let req: WsRequest = serde_json::from_str(&frame).unwrap();
 
         assert_eq!(req.data.raw_str(), data);
-        assert_eq!(req.data.method["Method"], "Ping");
+        assert_eq!(req.data.ts.to_rfc3339(), "2026-01-01T00:00:00+00:00");
         assert_eq!(req.uri.as_deref(), Some("/ping/signed"));
+    }
+
+    #[test]
+    fn frame_strings_are_borrowed_unless_escaped() {
+        let frame = br#"{"Signature":"abc","Uri":"/ping/signed","Data":{"Ts":"2026-01-01T00:00:00Z","Method":"Ping"}}"#;
+        let req: WsRequest = serde_json::from_slice(frame).unwrap();
+        assert!(matches!(req.signature, Cow::Borrowed("abc")));
+        assert!(matches!(req.uri, Some(Cow::Borrowed("/ping/signed"))));
+
+        // an escape can't be borrowed: still parsed, as an owned string
+        let frame = br#"{"Signature":"a\/c","Data":{"Ts":"2026-01-01T00:00:00Z","Method":"Ping"}}"#;
+        let req: WsRequest = serde_json::from_slice(frame).unwrap();
+        assert_eq!(req.signature, "a/c");
+        assert!(matches!(req.signature, Cow::Owned(_)));
+        assert!(req.uri.is_none(), "a missing Uri is None");
     }
 
     #[test]
@@ -144,6 +190,8 @@ mod tests {
             r#"{"Signature":"s","Data":{"Method":"Ping"}}"#,                                       // no Ts
             r#"{"Data":{"Ts":"2026-01-01T00:00:00Z","Method":"Ping"}}"#,                           // no Signature
             r#"{"Signature":"s","Data":{"Ts":"2026-01-01T00:00:00Z","Method":"Ping"}"#,            // truncated
+            r#"{"Signature":"s","Data":["2026-01-01T00:00:00Z"]}"#,                                // Data not an object
+            r#"{"Signature":"s","Data":{"Ts":"yesterday","Method":"Ping"}}"#,                      // bad Ts
         ] {
             assert!(
                 serde_json::from_str::<WsRequest>(bad).is_err(),
@@ -154,11 +202,10 @@ mod tests {
 
     #[test]
     fn authorize_method_parses() {
-        let m: WsMethod = serde_json::from_value(serde_json::json!({
-            "Method": "Authorize",
-            "Params": { "ApiKey": "01a01500-98d5-71fc-9038-71acb78d61c4" }
-        }))
-        .unwrap();
+        // parsed from the frame's Data, next to its Ts
+        let frame = r#"{"Signature":"s","Data":{"Ts":"2026-01-01T00:00:00Z","Method":"Authorize","Params":{"ApiKey":"01a01500-98d5-71fc-9038-71acb78d61c4"}}}"#;
+        let req: WsRequest = serde_json::from_str(frame).unwrap();
+        let m: WsMethod = req.data.method().unwrap();
         let WsMethod::Authorize { api_key } = m;
         assert_eq!(api_key.to_string(), "01a01500-98d5-71fc-9038-71acb78d61c4");
     }

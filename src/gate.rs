@@ -29,7 +29,7 @@ use tokio::sync::mpsc::UnboundedSender;
 pub(crate) const CFG_BACK_TOPIC_PART_COUNT: &str = "/service/backTopicPartitionsCount";
 
 /// pause between attempts to rebuild the back-topic consumer after its stream ended
-const BACK_CONSUMER_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+const BACK_CONSUMER_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
 
 #[derive(Clone)]
 pub(crate) struct RoutesMap {

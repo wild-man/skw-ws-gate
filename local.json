@@ -18,7 +18,7 @@
     "clientTimeoutSecs": 10,
     "maxInFlightFrames": 64,
     "maxPendingRequests": 300,
-    "maxSessionsPerToken": 10
+    "maxSessionsPerToken": 5
   },
   "iggy": {
     "url": "iggy://iggy:Secret123!@localhost:8081",

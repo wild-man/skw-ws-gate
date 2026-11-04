@@ -17,7 +17,8 @@
     "heartbeatIntervalSecs": 5,
     "clientTimeoutSecs": 10,
     "maxInFlightFrames": 64,
-    "maxPendingRequests": 300
+    "maxPendingRequests": 300,
+    "maxSessionsPerToken": 10
   },
   "iggy": {
     "url": "iggy://iggy:Secret123!@skw-iggy:3000",

@@ -29,7 +29,7 @@ use ntex::{
 use skw_lib_shared::AppError;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::cfg::{CFG_CLIENT_TIMEOUT, CFG_HEARTBEAT_INTERVAL, CFG_MAX_INFLIGHT_FRAMES, CFG_MAX_PENDING_REQUESTS};
+use crate::cfg::{CFG_CLIENT_TIMEOUT, CFG_HEARTBEAT_INTERVAL, CFG_MAX_INFLIGHT_FRAMES, CFG_MAX_PENDING_REQUESTS, CFG_MAX_SESSIONS_PER_TOKEN};
 use crate::crypto::{check_authorize, verify_signature};
 use crate::gate::{ConnectionEntry, PendingRequestEntry, PendingSlot, WsGateState, WsOutbound, publish_to_service};
 use crate::structs::{AuthState, WsMethod, WsRequest, WsState};
@@ -127,12 +127,27 @@ pub(crate) async fn handle_frame(
                                     unauthorized_close(&outbound_tx)
                                 }
                                 Ok(public_key) => {
+                                    // counted only for valid credentials, so unknown keys can't use up a key's sessions
+                                    let Some(session) = gate_state
+                                        .sessions
+                                        .try_acquire(api_key, *CFG_MAX_SESSIONS_PER_TOKEN)
+                                    else {
+                                        warn!(
+                                            "api key {} already has {} sessions, refusing connection {}",
+                                            api_key,
+                                            *CFG_MAX_SESSIONS_PER_TOKEN,
+                                            state.borrow().describe()
+                                        );
+                                        return Ok(too_many_sessions_close(&outbound_tx, &req.signature));
+                                    };
+
                                     let connection_id = {
                                         let mut state = state.borrow_mut();
                                         state.auth = AuthState::Authorized;
                                         state.hb = Instant::now();
                                         state.public_key = Some(public_key);
                                         state.api_key = Some(api_key);
+                                        state.session = Some(session);
                                         state.connection_id
                                     };
 
@@ -361,6 +376,7 @@ pub(crate) async fn ws_service(
         connection_id,
         pending: Arc::new(AtomicUsize::new(0)),
         peer_addr,
+        session: None,
     }));
     debug!("ws connection {} opened", state.borrow().describe());
 
@@ -378,6 +394,7 @@ pub(crate) async fn ws_service(
     // handler service for incoming websockets frames; at most CFG_MAX_INFLIGHT_FRAMES at once,
     // so one client's burst can't hold this worker (and its other connections) for long
     let gate_state_frames = gate_state.clone();
+    let state_shutdown = state.clone();
     let service = InFlightService::new(
         *CFG_MAX_INFLIGHT_FRAMES,
         fn_service(move |frame| {
@@ -390,10 +407,11 @@ pub(crate) async fn ws_service(
         }),
     );
 
-    // handler service for shutdown notification: stops the heartbeat task and
-    // deregisters this connection from the gate's connections registry
+    // handler service for shutdown notification: stops the heartbeat task, deregisters this
+    // connection from the gate's connections registry and frees its API key's session
     let on_shutdown = fn_shutdown(async move || {
         gate_state.connections.remove(&connection_id);
+        state_shutdown.borrow_mut().session.take();
         let _ = tx.send(());
     });
 
@@ -464,6 +482,11 @@ pub(crate) async fn heartbeat(
 fn build_ws_message(outbound: WsOutbound) -> Message {
     let json = match outbound {
         WsOutbound::Close(reason) => return Message::Close(Some(reason)),
+        WsOutbound::Error {
+            signature,
+            reason,
+            code,
+        } => serde_json::json!({ "Signature": signature, "ErrorMsg": reason, "ErrCode": code.as_u16() }),
         WsOutbound::Reply {
             signature,
             payload,
@@ -522,6 +545,19 @@ pub(crate) async fn ws_index(req: web::HttpRequest, state: web::types::State<WsG
 // successfully authorizes it; a bad/failed attempt closes the connection.
 pub(crate) fn unauthorized_close(outbound_tx: &UnboundedSender<WsOutbound>) -> Option<Message> {
     close_connection(outbound_tx, "Unauthorized") // @todo move to some Payload struct
+}
+
+/// Refuses an `Authorize` whose API key already holds `/service/maxSessionsPerToken` sessions:
+/// a 403 error reply to the frame, then Close 1008. Both go through the heartbeat task, so the
+/// reply is written before the Close.
+fn too_many_sessions_close(outbound_tx: &UnboundedSender<WsOutbound>, signature: &str) -> Option<Message> {
+    const REASON: &str = "Too many sessions";
+    let _ = outbound_tx.send(WsOutbound::Error {
+        signature: signature.to_string(),
+        reason: REASON,
+        code: StatusCode::FORBIDDEN,
+    });
+    close_connection(outbound_tx, REASON)
 }
 
 /// Closes the connection with policy code 1008 and `reason`. Goes through the heartbeat task,

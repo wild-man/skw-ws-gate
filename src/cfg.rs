@@ -75,3 +75,17 @@ pub(crate) static CFG_AUTH_SERVICE_URL: LazyLock<String> = LazyLock::new(|| {
 
     format!("{}{}", auth_service_url, INTERNAL_URL_PREFIX)
 });
+
+/// How many authorized connections (sessions) one API key may hold at once on this gate process;
+/// an `Authorize` over the limit is refused with 403 and the connection is closed (1008)
+pub(crate) static CFG_MAX_SESSIONS_PER_TOKEN: LazyLock<usize> = LazyLock::new(|| {
+    APP.config
+        .get("/service/maxSessionsPerToken")
+        .map(|v| {
+            v.as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .filter(|&n| n > 0)
+                .expect("invalid /service/maxSessionsPerToken")
+        })
+        .unwrap_or(5)
+});

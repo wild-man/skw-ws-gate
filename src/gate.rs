@@ -7,11 +7,12 @@ use std::{
     },
 };
 
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry};
 
 use skw_lib_shared::{
     APP, AppError,
     prelude::{
+        axum::StatusCode,
         chrono::*,
         consts::*,
         futures::StreamExt,
@@ -54,8 +55,61 @@ pub(crate) enum WsOutbound {
         signature: String,
         uri: String,
     },
+    /// the gate's own error reply to one frame, e.g. a refused `Authorize`
+    Error {
+        signature: String,
+        reason: &'static str,
+        code: StatusCode,
+    },
     /// send this Close frame, then close the socket (a client ignoring the Close can't keep it open)
     Close(ntex::web::ws::CloseReason),
+}
+
+/// Authorized connections (sessions) per API key on this gate process, limited by
+/// `/service/maxSessionsPerToken`. Each gate replica counts on its own.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Sessions(Arc<DashMap<Uuid, usize>>);
+
+impl Sessions {
+    /// Counts one more session of `api_key`, or `None` if it already holds `max`. Check and
+    /// increment happen under the key's shard lock, so connections authorizing at once on
+    /// different workers can't overshoot the limit.
+    pub(crate) fn try_acquire(&self, api_key: Uuid, max: usize) -> Option<SessionSlot> {
+        let mut count = self.0.entry(api_key).or_insert(0);
+        if *count >= max {
+            return None;
+        }
+        *count += 1;
+        drop(count);
+        Some(SessionSlot {
+            sessions: self.clone(),
+            api_key,
+        })
+    }
+
+    #[cfg(test)]
+    fn count(&self, api_key: &Uuid) -> usize {
+        self.0.get(api_key).map_or(0, |c| *c)
+    }
+}
+
+/// One session counted in [`Sessions`] for as long as it lives (held by the connection's
+/// `WsState`, released on connection shutdown); the key's entry goes away with its last session.
+#[derive(Debug)]
+pub(crate) struct SessionSlot {
+    sessions: Sessions,
+    api_key: Uuid,
+}
+
+impl Drop for SessionSlot {
+    fn drop(&mut self) {
+        if let Entry::Occupied(mut count) = self.sessions.0.entry(self.api_key) {
+            *count.get_mut() = count.get().saturating_sub(1);
+            if *count.get() == 0 {
+                count.remove();
+            }
+        }
+    }
 }
 
 /// One pending request counted in its connection's `WsState::pending` for as long as the
@@ -113,6 +167,7 @@ pub(crate) struct WsGateState {
     pub routes_map: RoutesMap,
     pub pending_requests: Arc<DashMap<String, PendingRequestEntry>>,
     pub connections: Arc<DashMap<Uuid, ConnectionEntry>>,
+    pub sessions: Sessions,
     pub _iggy_client: Arc<IggyClient>, // saved for future use if needed
 }
 
@@ -210,6 +265,7 @@ impl WsGateState {
             routes_map,
             pending_requests,
             connections,
+            sessions: Sessions::default(),
             _iggy_client: iggy_client,
         })
     }
@@ -424,5 +480,35 @@ mod tests {
         assert_eq!(pending.load(Ordering::Relaxed), 1);
         drop(b);
         assert_eq!(pending.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn sessions_are_limited_per_key_and_released_on_drop() {
+        let sessions = Sessions::default();
+        let (key, other) = (Uuid::now_v7(), Uuid::now_v7());
+
+        let a = sessions.try_acquire(key, 2).expect("first session");
+        let b = sessions.try_acquire(key, 2).expect("second session");
+        assert!(
+            sessions.try_acquire(key, 2).is_none(),
+            "third session over the limit"
+        );
+        assert_eq!(sessions.count(&key), 2, "a refused session is not counted");
+
+        // other keys have their own limit
+        let _c = sessions.try_acquire(other, 2).expect("other key's session");
+
+        drop(a);
+        assert_eq!(sessions.count(&key), 1);
+        let _d = sessions
+            .try_acquire(key, 2)
+            .expect("a freed session can be taken again");
+        drop(b);
+        drop(_d);
+        assert_eq!(sessions.count(&key), 0);
+        assert!(
+            !sessions.0.contains_key(&key),
+            "entry removed with the last session"
+        );
     }
 }

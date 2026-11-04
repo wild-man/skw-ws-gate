@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, atomic::AtomicUsize};
 use std::time::Instant;
 
+use crate::gate::SessionSlot;
 use skw_lib_shared::prelude::{jsonrpc::JsonRpcGateHttpRequest, serde::*, uuid::Uuid};
 
 /// A parsed value paired with the exact raw JSON text it came from. One
@@ -97,6 +98,9 @@ pub(crate) struct WsState {
     pub pending: Arc<AtomicUsize>,
     /// client's address as seen by the gate's socket (a proxy in front would show its own)
     pub peer_addr: Option<SocketAddr>,
+    /// this connection's place in its API key's `/service/maxSessionsPerToken`, taken on
+    /// Authorize, released on connection shutdown
+    pub session: Option<SessionSlot>,
 }
 
 impl WsState {

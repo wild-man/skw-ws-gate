@@ -375,11 +375,15 @@ pub(crate) async fn init_iggy(stream: &str, back_topic: &str, iggy_client: &Iggy
         .create_topic(
             &stream_id,
             back_topic,
-            partitions_count,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::ExpireDuration(IggyDuration::from_str("60s").unwrap()),
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(partitions_count),
+                compression_algorithm: Some(CompressionAlgorithm::None),
+                message_expiry: Some(IggyExpiry::ExpireDuration(
+                    IggyDuration::from_str("60s").unwrap(),
+                )),
+                max_topic_size: Some(MaxTopicSize::ServerDefault),
+                ..Default::default()
+            },
         )
         .await
     {
@@ -404,15 +408,7 @@ pub(crate) async fn init_iggy(stream: &str, back_topic: &str, iggy_client: &Iggy
                     skw_is_valid_name(&topic).unwrap_or_else(|| panic!("invalid topic name: {}", topic));
 
                     match iggy_client
-                        .create_topic(
-                            &stream_id,
-                            &topic,
-                            cfg.partitions_count,
-                            cfg.compression_algorithm,
-                            None,
-                            cfg.message_expiry,
-                            cfg.max_topic_size,
-                        )
+                        .create_topic(&stream_id, &topic, &cfg.create_options())
                         .await
                     {
                         Ok(t) => info!("created topic: {} (id:{}); stream: {}", topic, t.id, stream),

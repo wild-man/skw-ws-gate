@@ -1,5 +1,5 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     net::SocketAddr,
     rc::Rc,
     sync::{
@@ -12,10 +12,9 @@ use std::{
 use dashmap::mapref::entry::Entry;
 
 use ntex::{
-    chain,
     channel::oneshot,
     fn_service, rt,
-    service::{Service, fn_factory_with_config, fn_shutdown},
+    service::{self as svc, Service},
     time,
     util::{Bytes, inflight::InFlightService},
     web,
@@ -358,12 +357,18 @@ fn is_unsigned_topic(uri: Option<&str>) -> bool {
         .is_some_and(|t| matches!(t, SkwTopicType::Public | SkwTopicType::Open))
 }
 
-/// WebSockets service factory
-pub(crate) async fn ws_service(
-    sink: WsSink,
+/// the ws gate's web application state: shared by every worker (`web::server_with_config`)
+impl web::State for WsGateState {
+    type Error = web::DefaultError;
+}
+
+/// One connection's frame service. ntex 4 runs it with the connection's `WsSink` as pipeline
+/// state, so the heartbeat task (which owns writing to the sink) starts on the dispatcher's
+/// first readiness check, which ntex makes before decoding any frame.
+pub(crate) fn ws_service(
     gate_state: WsGateState,
     peer_addr: Option<SocketAddr>,
-) -> Result<impl Service<Frame, Response = Option<Message>, Error = AppError>, web::Error> {
+) -> impl Service<WsSink, Frame, Res = Option<Message>, Error = AppError> {
     let connection_id = Uuid::now_v7();
 
     // outbound channel: the only Send-safe handle to this connection reachable
@@ -390,8 +395,9 @@ pub(crate) async fn ws_service(
     // disconnect notification
     let (tx, rx) = oneshot::channel();
 
-    // start heartbeat + outbound-delivery task
-    rt::spawn(heartbeat(conn.clone(), sink, rx, outbound_rx));
+    // heartbeat + outbound-delivery task, started once the sink is known (see `readiness` below)
+    let heartbeat_start = Rc::new(Cell::new(Some((rx, outbound_rx))));
+    let conn_ready = conn.clone();
 
     // handler service for incoming websockets frames; at most CFG_MAX_INFLIGHT_FRAMES at once,
     // so one client's burst can't hold this worker (and its other connections) for long
@@ -402,16 +408,23 @@ pub(crate) async fn ws_service(
         fn_service(move |frame| handle_frame(conn_frames.clone(), frame)),
     );
 
-    // handler service for shutdown notification: stops the heartbeat task, deregisters this
-    // connection from the gate's connections registry and frees its API key's session
-    let on_shutdown = fn_shutdown(async move || {
-        conn.gate.connections.remove(&connection_id);
-        conn.state.borrow_mut().session.take();
-        let _ = tx.send(());
-    });
-
-    // pipe our service with on_shutdown callback
-    Ok(chain(service).and_then(on_shutdown))
+    svc::service(service)
+        // the dispatcher checks readiness before decoding the first frame: the sink is the
+        // pipeline state, so this starts the heartbeat for silent clients too. Readiness may be
+        // checked again later; the task is started only once.
+        .readiness(async move |sink: &WsSink| {
+            if let Some((rx, outbound_rx)) = heartbeat_start.take() {
+                rt::spawn(heartbeat(conn_ready.clone(), sink.clone(), rx, outbound_rx));
+            }
+            Ok(())
+        })
+        // shutdown: stops the heartbeat task, deregisters this connection from the gate's
+        // connections registry and frees its API key's session
+        .shutdown(async move |_: &WsSink| {
+            conn.gate.connections.remove(&connection_id);
+            conn.state.borrow_mut().session.take();
+            let _ = tx.send(());
+        })
 }
 
 /// sends ping to client every heartbeat interval, and is the sole task
@@ -432,6 +445,9 @@ pub(crate) async fn heartbeat(
     // restarted by every outbound message, so a busy connection never got pinged and was
     // dropped as silent once its replies stopped
     let ping = time::interval(*CFG_HEARTBEAT_INTERVAL);
+    // the first tick is immediate: take it here, so the first ping goes out one interval
+    // after the handshake instead of being the first frame the client gets
+    ping.tick().await;
     loop {
         tokio::select! {
             _ = ping.tick() => {
@@ -584,19 +600,18 @@ fn build_ws_message(outbound: WsOutbound) -> Message {
     }
 }
 
-/// do websocket handshake and start web sockets service
-pub(crate) async fn ws_index(req: web::HttpRequest, state: web::types::State<WsGateState>) -> Result<web::HttpResponse, web::Error> {
-    let gate_state = state.get_ref().clone();
+/// Does the websocket handshake and serves the connection until it ends (ntex 4 `start` runs
+/// the whole connection). A failed handshake is answered by `start` itself; after a handshake
+/// the socket belongs to the ws dispatcher, so the response returned here is never sent.
+pub(crate) async fn ws_index(gate_state: &WsGateState, _: (), req: web::HttpRequest) -> web::HttpResponse {
     let peer_addr = req.peer_addr();
-    start(
-        req,
-        None::<String>,
-        fn_factory_with_config(move |sink| {
-            let gate_state = gate_state.clone();
-            async move { ws_service(sink, gate_state, peer_addr).await }
-        }),
-    )
-    .await
+    if let Err(e) = start(&req, None, ws_service(gate_state.clone(), peer_addr)).await {
+        debug!(
+            "ws connection from {:?} ended with error: {:?}",
+            peer_addr, e
+        );
+    }
+    web::HttpResponse::Ok().build()
 }
 
 // connection is not authorized until the client's first message

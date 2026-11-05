@@ -1,4 +1,4 @@
-use ntex::web;
+use ntex::{SharedCfg, web};
 
 use skw_lib_shared::{
     APP, AppError,
@@ -52,15 +52,18 @@ async fn main() -> Result<(), AppError> {
 
     info!("starting skw-ws-gate listening on https://{}", bind_addr);
 
-    web::server(async move || {
-        web::App::new()
-            .state(ws_state.clone())
-            // enable logger
-            .middleware(web::middleware::Logger::default())
-            // websocket route
-            .service(web::resource("/ws/").route(web::get().to(ws_index)))
-    })
-    .bind_rustls(&bind_addr, &tls_config)
+    // one shared gate state for all workers (it is all `Arc`s), handed to each worker's app
+    web::server_with_config(
+        async move || Ok::<_, std::io::Error>(ws_state.clone()),
+        async |_| {
+            web::App::<gate::WsGateState>::new()
+                // enable logger
+                .middleware(web::middleware::Logger::default())
+                // websocket route
+                .service(web::resource("/ws/").route(web::get().to_with_state(ws_index)))
+        },
+    )
+    .bind_rustls(&bind_addr, &tls_config, SharedCfg::default())
     .map_err(|e| AppError::Custom(e.to_string()))?
     .workers(workers)
     .run()

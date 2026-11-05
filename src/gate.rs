@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     str::FromStr,
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicI64, AtomicUsize, Ordering},
     },
 };
@@ -30,6 +30,9 @@ pub(crate) const CFG_BACK_TOPIC_PART_COUNT: &str = "/service/backTopicPartitions
 
 /// pause between attempts to rebuild the back-topic consumer after its stream ended
 const BACK_CONSUMER_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// `http-method` header of every frame the gate publishes; a clone shares the bytes (no allocation)
+static HTTP_METHOD_WS: LazyLock<HeaderValue> = LazyLock::new(|| HeaderValue::from_str("WS").expect("\"WS\" is a valid header value"));
 
 pub(crate) struct RoutesMap {
     pub map: HashMap<String, Arc<IggyProducer>>,
@@ -441,16 +444,15 @@ pub(crate) async fn publish_to_service(
     );
 
     if let Some(key) = api_key {
+        // the uuid's text on the stack; the same hyphenated lowercase form `to_string()` gives
+        let mut buf = Uuid::encode_buffer();
         headers.insert(
             header_keys::API_KEY.clone(),
-            HeaderValue::from_str(&key.to_string())?,
+            HeaderValue::from_str(key.hyphenated().encode_lower(&mut buf))?,
         );
     }
 
-    headers.insert(
-        header_keys::HTTP_METHOD.clone(),
-        HeaderValue::from_str("WS")?,
-    );
+    headers.insert(header_keys::HTTP_METHOD.clone(), HTTP_METHOD_WS.clone());
 
     headers.insert(header_keys::HTTP_PATH.clone(), HeaderValue::from_str(uri)?);
 
@@ -468,6 +470,11 @@ pub(crate) async fn publish_to_service(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_method_ws_header_builds() {
+        assert_eq!(HTTP_METHOD_WS.as_str().unwrap(), "WS");
+    }
 
     #[test]
     fn pending_slot_counts_while_alive() {

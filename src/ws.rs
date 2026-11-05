@@ -247,22 +247,15 @@ async fn dispatch_request(
     signature: &str,
     req: WsRequest,
 ) -> Option<Message> {
-    let uri = req.uri.clone().unwrap_or_default();
-    let mut slug_split = uri.trim_matches('/').split("/");
+    // moved out of `req` (its other fields are still used below), copied once into the entry
+    let uri = req.uri.unwrap_or_default();
 
-    let slug1 = slug_split.next();
-    let slug2 = slug_split.next();
-
-    let topic_key = match (slug1, slug2) {
-        (None, _) => {
-            return error_message(
-                &req.signature,
-                "missing or empty uri",
-                StatusCode::BAD_REQUEST,
-            );
-        }
-        (Some(s1), None) => s1,
-        (Some(s1), Some(s2)) => &format!("{s1}/{s2}"),
+    let Some(topic_key) = route_key(&uri) else {
+        return error_message(
+            &req.signature,
+            "missing or empty uri",
+            StatusCode::BAD_REQUEST,
+        );
     };
 
     let Some(producer) = gate_state.routes_map.map.get(topic_key).cloned() else {
@@ -317,7 +310,7 @@ async fn dispatch_request(
                     warn!("timeout waiting for backend response signature: {}", s);
                     let _ = entry.outbound.send(WsOutbound::Timeout {
                         signature: entry.reply_id,
-                        uri: uri.clone(),
+                        uri: entry.uri,
                     });
                     return;
                 }
@@ -327,7 +320,6 @@ async fn dispatch_request(
         }
     });
 
-    let uri = req.uri.unwrap_or_default();
     if let Err(e) = publish_to_service(
         producer,
         api_key.as_ref(),
@@ -347,6 +339,19 @@ async fn dispatch_request(
     }
 
     None
+}
+
+/// The `RoutesMap` key of `uri`: its first two path segments, as a slice of the uri itself
+/// (`"/ping/signed/x"` -> `"ping/signed"`), so the lookup allocates nothing. `None` for an empty uri.
+fn route_key(uri: &str) -> Option<&str> {
+    let trimmed = uri.trim_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(match trimmed.match_indices('/').nth(1) {
+        Some((end, _)) => &trimmed[..end],
+        None => trimmed,
+    })
 }
 
 /// `uri` targets a public/open topic (`/{service}/public|open`), which needs no authorization
@@ -614,6 +619,16 @@ mod tests {
         assert!(!is_unsigned_topic(Some("/ping/bogus")));
         assert!(!is_unsigned_topic(Some("")));
         assert!(!is_unsigned_topic(None));
+    }
+
+    #[test]
+    fn route_keys() {
+        assert_eq!(route_key("/ping/signed"), Some("ping/signed"));
+        assert_eq!(route_key("ping/signed/extra"), Some("ping/signed"));
+        assert_eq!(route_key("/ping"), Some("ping"));
+        assert_eq!(route_key("ping//x"), Some("ping/"));
+        assert_eq!(route_key(""), None);
+        assert_eq!(route_key("///"), None);
     }
 
     fn reply_json(outbound: WsOutbound) -> serde_json::Value {

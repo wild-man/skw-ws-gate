@@ -1,5 +1,4 @@
 use std::net::SocketAddr;
-use std::sync::{Arc, atomic::AtomicUsize};
 use std::time::Instant;
 
 use crate::gate::SessionSlot;
@@ -113,8 +112,6 @@ pub(crate) struct WsState {
     /// minted once per connection; used to address this connection in the
     /// gate's connections registry (registered only after Authorize)
     pub connection_id: Uuid,
-    /// requests of this connection waiting for their reply (see `gate::PendingSlot`)
-    pub pending: Arc<AtomicUsize>,
     /// client's address as seen by the gate's socket (a proxy in front would show its own)
     pub peer_addr: Option<SocketAddr>,
     /// this connection's place in its API key's `/service/maxSessionsPerToken`, taken on

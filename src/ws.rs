@@ -54,13 +54,28 @@ fn refresh_hb<T>(state: &RefCell<WsState>, parsed: T) -> T {
     parsed
 }
 
+/// One connection's context, shared by `Rc` between its frame service, heartbeat task and
+/// shutdown hook. A frame clones this one non-atomic `Rc` instead of the gate state's `Arc`s
+/// (refcounts written by every connection on every worker), the outbound sender and the
+/// pending counter.
+pub(crate) struct Connection {
+    pub state: RefCell<WsState>,
+    pub gate: WsGateState,
+    pub outbound_tx: UnboundedSender<WsOutbound>,
+    /// requests of this connection waiting for their reply (see `gate::PendingSlot`);
+    /// outside `state`, so a frame can use it across `.await` without a `RefCell` borrow
+    pub pending: Arc<AtomicUsize>,
+}
+
 /// handler for a single incoming websocket frame
-pub(crate) async fn handle_frame(
-    state: Rc<RefCell<WsState>>,
-    gate_state: WsGateState,
-    outbound_tx: UnboundedSender<WsOutbound>,
-    frame: Frame,
-) -> Result<Option<Message>, AppError> {
+pub(crate) async fn handle_frame(conn: Rc<Connection>, frame: Frame) -> Result<Option<Message>, AppError> {
+    // borrowed from the connection for the whole frame: nothing cloned
+    let Connection {
+        state,
+        gate: gate_state,
+        outbound_tx,
+        pending,
+    } = &*conn;
     let item = match frame {
         // update heartbeat: any responsive client stays connected, authorized or not,
         // since public/open requests need no authorization
@@ -77,31 +92,30 @@ pub(crate) async fn handle_frame(
         }
 
         // validate the frame is valid UTF-8 *and* deserializes into our expected shape
-        Frame::Text(text) => match refresh_hb(&state, serde_json::from_slice::<WsRequest>(&text)) {
+        Frame::Text(text) => match refresh_hb(state, serde_json::from_slice::<WsRequest>(&text)) {
             Ok(req) => {
                 // checked before the signature check: a client over the limit costs no more work.
                 // Check and count (in `dispatch_request`) run before the first `.await`, and a
                 // connection's frames share one worker thread, so the limit can't be overshot
-                let pending = state.borrow().pending.clone();
                 if pending.load(Ordering::Relaxed) >= *CFG_MAX_PENDING_REQUESTS {
                     warn!(
                         "connection {} has {} pending requests, closing",
                         state.borrow().describe(),
                         *CFG_MAX_PENDING_REQUESTS
                     );
-                    return Ok(close_connection(&outbound_tx, "Too many pending requests"));
+                    return Ok(close_connection(outbound_tx, "Too many pending requests"));
                 }
 
                 // public/open topics need neither authorization nor a valid signature (like
                 // gates/api); `Signature` is then only the client's request id, echoed in the reply
                 if is_unsigned_topic(req.uri.as_deref()) {
-                    return Ok(dispatch_request(&gate_state, &outbound_tx, &pending, None, req).await);
+                    return Ok(dispatch_request(gate_state, outbound_tx, pending, None, req).await);
                 }
 
                 let auth = state.borrow().auth;
 
                 match auth {
-                    AuthState::Authorizing => unauthorized_close(&outbound_tx),
+                    AuthState::Authorizing => unauthorized_close(outbound_tx),
 
                     AuthState::Pending => {
                         // claim the single authorization attempt synchronously,
@@ -119,7 +133,7 @@ pub(crate) async fn handle_frame(
                                         api_key,
                                         state.borrow().describe()
                                     );
-                                    unauthorized_close(&outbound_tx)
+                                    unauthorized_close(outbound_tx)
                                 }
                                 Ok(public_key) => {
                                     // counted only for valid credentials, so unknown keys can't use up a key's sessions
@@ -133,7 +147,7 @@ pub(crate) async fn handle_frame(
                                             *CFG_MAX_SESSIONS_PER_TOKEN,
                                             state.borrow().describe()
                                         );
-                                        return Ok(too_many_sessions_close(&outbound_tx, &req.signature));
+                                        return Ok(too_many_sessions_close(outbound_tx, &req.signature));
                                     };
 
                                     let connection_id = {
@@ -159,9 +173,9 @@ pub(crate) async fn handle_frame(
                                     //@todo replace to Payload struct like in api gate
                                     Some(Message::Text(r#"{"Authorized":true}"#.into()))
                                 }
-                                Err(_) => unauthorized_close(&outbound_tx),
+                                Err(_) => unauthorized_close(outbound_tx),
                             },
-                            Err(_) => unauthorized_close(&outbound_tx),
+                            Err(_) => unauthorized_close(outbound_tx),
                         }
                     }
                     AuthState::Authorized => {
@@ -170,7 +184,7 @@ pub(crate) async fn handle_frame(
                             let state = state.borrow();
                             (state.public_key, state.api_key)
                         }) else {
-                            return Ok(unauthorized_close(&outbound_tx));
+                            return Ok(unauthorized_close(outbound_tx));
                         };
 
                         match verify_signature(&public_key, &req.signature, req.data.raw_str()) {
@@ -183,8 +197,8 @@ pub(crate) async fn handle_frame(
                                 );
                                 error_message(&req.signature, "request outdated", StatusCode::CONFLICT)
                             }
-                            Ok(()) => dispatch_request(&gate_state, &outbound_tx, &pending, Some(api_key), req).await,
-                            Err(_) => unauthorized_close(&outbound_tx),
+                            Ok(()) => dispatch_request(gate_state, outbound_tx, pending, Some(api_key), req).await,
+                            Err(_) => unauthorized_close(outbound_tx),
                         }
                     }
                 }
@@ -196,7 +210,7 @@ pub(crate) async fn handle_frame(
                     err
                 );
 
-                unauthorized_close(&outbound_tx)
+                unauthorized_close(outbound_tx)
             }
         },
 
@@ -352,50 +366,47 @@ pub(crate) async fn ws_service(
 ) -> Result<impl Service<Frame, Response = Option<Message>, Error = AppError>, web::Error> {
     let connection_id = Uuid::now_v7();
 
-    let state = Rc::new(RefCell::new(WsState {
-        hb: Instant::now(),
-        auth: AuthState::Pending,
-        public_key: None,
-        api_key: None,
-        connection_id,
-        pending: Arc::new(AtomicUsize::new(0)),
-        peer_addr,
-        session: None,
-    }));
-    debug!("ws connection {} opened", state.borrow().describe());
-
     // outbound channel: the only Send-safe handle to this connection reachable
     // from other tasks (WsSink itself is !Send, thread-affine to this
     // connection's worker thread — see heartbeat below, the sole owner of `sink`)
     let (outbound_tx, outbound_rx) = tokio::sync::mpsc::unbounded_channel::<WsOutbound>();
 
+    let conn = Rc::new(Connection {
+        state: RefCell::new(WsState {
+            hb: Instant::now(),
+            auth: AuthState::Pending,
+            public_key: None,
+            api_key: None,
+            connection_id,
+            peer_addr,
+            session: None,
+        }),
+        gate: gate_state,
+        outbound_tx,
+        pending: Arc::new(AtomicUsize::new(0)),
+    });
+    debug!("ws connection {} opened", conn.state.borrow().describe());
+
     // disconnect notification
     let (tx, rx) = oneshot::channel();
 
     // start heartbeat + outbound-delivery task
-    rt::spawn(heartbeat(state.clone(), sink, rx, outbound_rx));
+    rt::spawn(heartbeat(conn.clone(), sink, rx, outbound_rx));
 
     // handler service for incoming websockets frames; at most CFG_MAX_INFLIGHT_FRAMES at once,
     // so one client's burst can't hold this worker (and its other connections) for long
-    let gate_state_frames = gate_state.clone();
-    let state_shutdown = state.clone();
+    let conn_frames = conn.clone();
     let service = InFlightService::new(
         *CFG_MAX_INFLIGHT_FRAMES,
-        fn_service(move |frame| {
-            handle_frame(
-                state.clone(),
-                gate_state_frames.clone(),
-                outbound_tx.clone(),
-                frame,
-            )
-        }),
+        // one non-atomic `Rc` clone per frame
+        fn_service(move |frame| handle_frame(conn_frames.clone(), frame)),
     );
 
     // handler service for shutdown notification: stops the heartbeat task, deregisters this
     // connection from the gate's connections registry and frees its API key's session
     let on_shutdown = fn_shutdown(async move || {
-        gate_state.connections.remove(&connection_id);
-        state_shutdown.borrow_mut().session.take();
+        conn.gate.connections.remove(&connection_id);
+        conn.state.borrow_mut().session.take();
         let _ = tx.send(());
     });
 
@@ -411,11 +422,12 @@ pub(crate) async fn ws_service(
 /// runtime and cannot touch `WsSink` directly, since it wraps an `Rc` and is
 /// `!Send`/`!Sync`, thread-affine to this connection's worker thread).
 pub(crate) async fn heartbeat(
-    state: Rc<RefCell<WsState>>,
+    conn: Rc<Connection>,
     sink: WsSink,
     mut rx: oneshot::Receiver<()>,
     mut outbound_rx: tokio::sync::mpsc::UnboundedReceiver<WsOutbound>,
 ) {
+    let state = &conn.state;
     // one interval for the whole connection: a `sleep` created per loop pass would be
     // restarted by every outbound message, so a busy connection never got pinged and was
     // dropped as silent once its replies stopped
@@ -444,8 +456,9 @@ pub(crate) async fn heartbeat(
                 sink.io().close();
                 return;
             }
-            // once all senders are dropped `recv()` yields `None` at once on every poll; a failed
-            // pattern disables this branch instead of spinning, teardown is up to the other branches
+            // `conn` holds a sender, so `recv()` doesn't yield `None` while this task runs; if it
+            // ever did, the failed pattern disables this branch instead of spinning, and teardown
+            // stays with the other branches (shutdown oneshot, client timeout, send failures)
             Some(msg) = outbound_rx.recv() => {
                 let close = matches!(msg, WsOutbound::Close(_));
                 if sink.send(build_ws_message(msg)).await.is_err() {

@@ -27,6 +27,11 @@ impl<T> Signed<T> {
     pub(crate) fn raw_str(&self) -> &str {
         self.raw.get()
     }
+
+    /// The raw text as an owned `String`, without copying it (`Box<RawValue>` is a `Box<str>`)
+    pub(crate) fn into_raw_string(self) -> String {
+        Box::<str>::from(self.raw).into_string()
+    }
 }
 
 impl<T> std::ops::Deref for Signed<T> {

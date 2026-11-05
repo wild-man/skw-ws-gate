@@ -44,7 +44,7 @@ pub(crate) struct RoutesMap {
 #[derive(Debug, Clone)]
 pub(crate) enum WsOutbound {
     Reply {
-        signature: String,
+        signature: Arc<str>,
         payload: Vec<u8>,
         service_error: Option<SkwServiceHttpError>,
         /// Some = provisional reply (Created/Accepted): request taken, its result comes later
@@ -54,12 +54,12 @@ pub(crate) enum WsOutbound {
         payload: Vec<u8>,
     },
     Timeout {
-        signature: String,
+        signature: Arc<str>,
         uri: String,
     },
     /// the gate's own error reply to one frame, e.g. a refused `Authorize`
     Error {
-        signature: String,
+        signature: Arc<str>,
         reason: &'static str,
         code: StatusCode,
     },
@@ -137,7 +137,8 @@ pub(crate) struct PendingRequestEntry {
     /// id echoed back to the client as the reply's `Signature`: the request signature for signed
     /// requests, the client-chosen request id for unsigned ones (whose registry key is minted by
     /// the gate, so ids picked by different clients can't collide)
-    pub reply_id: String,
+    /// (for signed requests the same `Arc` as the registry key)
+    pub reply_id: Arc<str>,
     pub uri: String,
     pub ts_gate_published: DateTime<Utc>,
     /// when the timeout watchdog gives up on this request (unix millis); a provisional reply
@@ -167,7 +168,8 @@ pub(crate) struct ConnectionEntry {
 #[derive(Clone)]
 pub(crate) struct WsGateState {
     pub routes_map: Arc<RoutesMap>,
-    pub pending_requests: Arc<DashMap<String, PendingRequestEntry>>,
+    /// keyed by the request id, shared (`Arc`) with its timeout watchdog and replies
+    pub pending_requests: Arc<DashMap<Arc<str>, PendingRequestEntry>>,
     pub connections: Arc<DashMap<Uuid, ConnectionEntry>>,
     pub sessions: Sessions,
     pub _iggy_client: Arc<IggyClient>, // saved for future use if needed
@@ -226,7 +228,7 @@ impl WsGateState {
         // fail fast at startup; later failures are retried by the receiver loop below
         let mut iggy_consumer = build_back_consumer(&iggy_client, &consumer_name, stream, back_topic).await?;
 
-        let pending_requests: Arc<DashMap<String, PendingRequestEntry>> = Arc::new(DashMap::with_capacity(1024));
+        let pending_requests: Arc<DashMap<Arc<str>, PendingRequestEntry>> = Arc::new(DashMap::with_capacity(1024));
         let connections: Arc<DashMap<Uuid, ConnectionEntry>> = Arc::new(DashMap::with_capacity(1024));
 
         let pr = pending_requests.clone();
@@ -295,12 +297,12 @@ async fn build_back_consumer(iggy_client: &IggyClient, consumer_name: &str, stre
 /// target-connection-id for unsolicited push messages that aren't replies to
 /// any pending request. No fan-out: O(1) lookup instead of broadcasting to
 /// every connection.
-fn dispatch_back_message(pending: &DashMap<String, PendingRequestEntry>, connections: &DashMap<Uuid, ConnectionEntry>, m: WsBackMessage) {
+fn dispatch_back_message(pending: &DashMap<Arc<str>, PendingRequestEntry>, connections: &DashMap<Uuid, ConnectionEntry>, m: WsBackMessage) {
     // a provisional reply (Created/Accepted) is delivered but keeps the request pending:
     // its final reply comes later with the same signature (or the watchdog times it out)
     if m.service_status.is_some()
         && let Some(sig) = &m.signature
-        && let Some(entry) = pending.get(sig)
+        && let Some(entry) = pending.get(sig.as_str())
     {
         debug!(
             "ws provisional reply delivered: signature={} uri={} status={:?} elapsed={:?}",
@@ -321,7 +323,7 @@ fn dispatch_back_message(pending: &DashMap<String, PendingRequestEntry>, connect
 
     // a final reply (or an error) ends the request
     if let Some(sig) = &m.signature
-        && let Some((signature, entry)) = pending.remove(sig)
+        && let Some((signature, entry)) = pending.remove(sig.as_str())
     {
         debug!(
             "ws reply delivered: signature={} uri={} elapsed={:?}",
@@ -434,7 +436,7 @@ pub(crate) async fn publish_to_service(
     api_key: Option<&Uuid>,
     signature: &str,
     uri: &str,
-    body: &[u8],
+    body: String,
 ) -> Result<(), AppError> {
     let mut headers = std::collections::BTreeMap::new();
 
@@ -456,7 +458,8 @@ pub(crate) async fn publish_to_service(
 
     headers.insert(header_keys::HTTP_PATH.clone(), HeaderValue::from_str(uri)?);
 
-    let bytes = Bytes::copy_from_slice(body);
+    // takes over the frame's buffer (len == capacity): no copy
+    let bytes = Bytes::from(body);
     let message = IggyMessage::builder()
         .payload(bytes)
         .user_headers(headers)

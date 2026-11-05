@@ -24,3 +24,10 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 iggy = { workspace = true }
 dashmap = { workspace = true }
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "request_id"
+harness = false

@@ -91,16 +91,7 @@ pub(crate) async fn handle_frame(
                 // public/open topics need neither authorization nor a valid signature (like
                 // gates/api); `Signature` is then only the client's request id, echoed in the reply
                 if is_unsigned_topic(req.uri.as_deref()) {
-                    let rnd_signature = skw_random_signature();
-                    return Ok(dispatch_request(
-                        &gate_state,
-                        &outbound_tx,
-                        &pending,
-                        None,
-                        &rnd_signature,
-                        req,
-                    )
-                    .await);
+                    return Ok(dispatch_request(&gate_state, &outbound_tx, &pending, None, req).await);
                 }
 
                 let auth = state.borrow().auth;
@@ -174,7 +165,7 @@ pub(crate) async fn handle_frame(
                     }
                     AuthState::Authorized => {
                         // set together with AuthState::Authorized; refuse rather than panic if that ever breaks
-                        let (Some(public_key), api_key) = ({
+                        let (Some(public_key), Some(api_key)) = ({
                             let state = state.borrow();
                             (state.public_key, state.api_key)
                         }) else {
@@ -191,19 +182,7 @@ pub(crate) async fn handle_frame(
                                 );
                                 error_message(&req.signature, "request outdated", StatusCode::CONFLICT)
                             }
-                            Ok(()) => {
-                                // signature is verified and unforgeable, so it doubles as the correlation id
-                                let signature = req.signature.clone();
-                                dispatch_request(
-                                    &gate_state,
-                                    &outbound_tx,
-                                    &pending,
-                                    api_key,
-                                    &signature,
-                                    req,
-                                )
-                                .await
-                            }
+                            Ok(()) => dispatch_request(&gate_state, &outbound_tx, &pending, Some(api_key), req).await,
                             Err(_) => unauthorized_close(&outbound_tx),
                         }
                     }
@@ -230,11 +209,12 @@ pub(crate) async fn handle_frame(
     Ok(item)
 }
 
-/// Resolves the target service from `req.uri`, registers a pending-request
-/// entry keyed by `signature` (also sent to the service as the iggy
-/// signature header), spawns a timeout watchdog, and publishes the request to
-/// the resolved service topic. The reply reaches the client under
-/// `req.signature`. Returns `None` immediately without waiting for a reply —
+/// Resolves the target service from `req.uri`, registers a pending-request entry, spawns a
+/// timeout watchdog, and publishes the request to the resolved service topic. The entry's key
+/// (also sent to the service as the iggy signature header) is the request's verified signature
+/// for a signed request (`api_key` is `Some`: unforgeable, so it doubles as the correlation id)
+/// and a gate-minted id for an unsigned one, whose `Signature` is only the client's request id.
+/// The reply reaches the client under `req.signature`. Returns `None` immediately without waiting for a reply —
 /// the frame-processing service stays free to handle the next frame
 /// (heartbeats, other requests) on this connection while the reply is
 /// delivered later, asynchronously, via the shared back-topic consumer loop
@@ -244,39 +224,41 @@ async fn dispatch_request(
     outbound_tx: &UnboundedSender<WsOutbound>,
     pending: &Arc<AtomicUsize>,
     api_key: Option<Uuid>,
-    signature: &str,
     req: WsRequest,
 ) -> Option<Message> {
-    // moved out of `req` (its other fields are still used below), copied once into the entry
-    let uri = req.uri.unwrap_or_default();
+    let WsRequest {
+        signature,
+        uri,
+        data,
+    } = req;
+    // shared by the registry key, the watchdog and every reply: one copy of the id
+    let reply_id: Arc<str> = signature.into();
+    let key: Arc<str> = match api_key {
+        Some(_) => reply_id.clone(),
+        None => skw_random_signature().into(),
+    };
+    // copied once, into the entry
+    let uri = uri.unwrap_or_default();
 
     let Some(topic_key) = route_key(&uri) else {
-        return error_message(
-            &req.signature,
-            "missing or empty uri",
-            StatusCode::BAD_REQUEST,
-        );
+        return error_message(&reply_id, "missing or empty uri", StatusCode::BAD_REQUEST);
     };
 
     let Some(producer) = gate_state.routes_map.map.get(topic_key).cloned() else {
-        return error_message(&req.signature, "unknown service", StatusCode::BAD_REQUEST);
+        return error_message(&reply_id, "unknown service", StatusCode::BAD_REQUEST);
     };
 
     // a signed request's signature is its key: a duplicate still in flight would overwrite the
     // first entry and run the request twice, so it is refused until the first one is answered
-    match gate_state.pending_requests.entry(signature.to_string()) {
+    match gate_state.pending_requests.entry(key.clone()) {
         Entry::Occupied(_) => {
-            warn!("request already pending, signature: {}", signature);
-            return error_message(
-                &req.signature,
-                "request already pending",
-                StatusCode::CONFLICT,
-            );
+            warn!("request already pending, signature: {}", key);
+            return error_message(&reply_id, "request already pending", StatusCode::CONFLICT);
         }
         Entry::Vacant(slot) => {
             slot.insert(PendingRequestEntry {
                 outbound: outbound_tx.clone(),
-                reply_id: req.signature.clone(),
+                reply_id: reply_id.clone(),
                 uri: uri.clone(),
                 ts_gate_published: Utc::now(),
                 deadline_ms: AtomicI64::new(Utc::now().timestamp_millis() + BACK_MESSAGE_TIMEOUT.as_millis() as i64),
@@ -289,13 +271,13 @@ async fn dispatch_request(
     // entry (no reply arrived in time), remove it ourselves and notify the
     // client — mirrors gates/api's 30s BACK_MESSAGE_TIMEOUT / 504 behavior
     let pending_requests = gate_state.pending_requests.clone();
-    let signature_for_timeout = signature.to_string();
+    let watched = key.clone();
 
     // (a provisional reply moves the deadline, so the watchdog sleeps again until the new one)
     tokio::spawn(async move {
         loop {
             // the map guard must not be held across the sleep
-            let wait_ms = match pending_requests.get(&signature_for_timeout) {
+            let wait_ms = match pending_requests.get(&*watched) {
                 Some(entry) => entry.deadline_ms() - Utc::now().timestamp_millis(),
                 None => return,
             };
@@ -303,7 +285,7 @@ async fn dispatch_request(
                 tokio::time::sleep(std::time::Duration::from_millis(wait_ms as u64)).await;
                 continue;
             }
-            match pending_requests.remove_if(&signature_for_timeout, |_, e| {
+            match pending_requests.remove_if(&*watched, |_, e| {
                 e.deadline_ms() <= Utc::now().timestamp_millis()
             }) {
                 Some((s, entry)) => {
@@ -323,16 +305,16 @@ async fn dispatch_request(
     if let Err(e) = publish_to_service(
         producer,
         api_key.as_ref(),
-        signature,
+        &key,
         &uri,
-        req.data.raw_str().as_bytes(),
+        data.into_raw_string(),
     )
     .await
     {
         error!("publish to service error: {}", e);
-        gate_state.pending_requests.remove(signature);
+        gate_state.pending_requests.remove(&*key);
         return error_message(
-            &req.signature,
+            &reply_id,
             "internal error",
             StatusCode::INTERNAL_SERVER_ERROR,
         );
@@ -487,7 +469,7 @@ fn build_ws_message(outbound: WsOutbound) -> Message {
             signature,
             reason,
             code,
-        } => serde_json::json!({ "Signature": signature, "ErrorMsg": reason, "ErrCode": code.as_u16() }),
+        } => serde_json::json!({ "Signature": &*signature, "ErrorMsg": reason, "ErrCode": code.as_u16() }),
         WsOutbound::Reply {
             signature,
             payload,
@@ -504,7 +486,7 @@ fn build_ws_message(outbound: WsOutbound) -> Message {
                 .unwrap_or(StatusCode::OK);
 
             serde_json::json!({
-                "Signature": signature,
+                "Signature": &*signature,
                 "Status": status.as_u16(),
                 "ErrorMsg": service_error.as_ref().map(|e| e.to_string()),
                 "ErrCode": service_error.map(|e| e.status_code().as_u16()),
@@ -517,7 +499,7 @@ fn build_ws_message(outbound: WsOutbound) -> Message {
         }
         WsOutbound::Timeout { signature, uri } => {
             serde_json::json!({
-                "Signature": signature,
+                "Signature": &*signature,
                 "ErrorMsg": "Timeout",
                 "ErrCode": StatusCode::GATEWAY_TIMEOUT.as_u16(),
                 "Uri": uri,
@@ -554,7 +536,7 @@ pub(crate) fn unauthorized_close(outbound_tx: &UnboundedSender<WsOutbound>) -> O
 fn too_many_sessions_close(outbound_tx: &UnboundedSender<WsOutbound>, signature: &str) -> Option<Message> {
     const REASON: &str = "Too many sessions";
     let _ = outbound_tx.send(WsOutbound::Error {
-        signature: signature.to_string(),
+        signature: signature.into(),
         reason: REASON,
         code: StatusCode::FORBIDDEN,
     });

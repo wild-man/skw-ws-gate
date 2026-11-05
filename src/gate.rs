@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     str::FromStr,
     sync::{
         Arc, LazyLock,
@@ -45,13 +45,14 @@ pub(crate) struct RoutesMap {
 pub(crate) enum WsOutbound {
     Reply {
         signature: Arc<str>,
-        payload: Vec<u8>,
+        /// the service's JSON reply, moved out of the iggy message (not copied)
+        payload: Bytes,
         service_error: Option<SkwServiceHttpError>,
         /// Some = provisional reply (Created/Accepted): request taken, its result comes later
         service_status: Option<SkwServiceStatus>,
     },
     Push {
-        payload: Vec<u8>,
+        payload: Bytes,
     },
     Timeout {
         signature: Arc<str>,
@@ -177,32 +178,45 @@ pub(crate) struct WsGateState {
 
 /// parallel to gates/api's IggyReceivedMessage, plus an optional
 /// target-connection-id for proactive/unsolicited push (consumption only —
-/// no backend service produces this header yet)
-#[derive(Debug, Clone)]
-struct WsBackMessage {
-    payload: Vec<u8>,
-    signature: Option<String>,
+/// no backend service produces this header yet). Its headers are borrowed from the
+/// decoded header map, its payload moved out of the iggy message: nothing is copied.
+#[derive(Debug)]
+struct WsBackMessage<'a> {
+    payload: Bytes,
+    signature: Option<&'a str>,
     service_error: Option<SkwServiceHttpError>,
     service_status: Option<SkwServiceStatus>,
     target_connection_id: Option<Uuid>,
 }
 
-impl TryFrom<ReceivedMessage> for WsBackMessage {
-    type Error = AppError;
+/// a string header, borrowed (`header_str` would copy it). Every service writes these
+/// headers with `HeaderValue::from_str`, i.e. as the String kind `as_str` reads.
+fn header<'a>(headers: Option<&'a BTreeMap<HeaderKey, HeaderValue>>, key: &HeaderKey) -> Option<&'a str> {
+    headers?.get(key)?.as_str().ok()
+}
 
-    fn try_from(m: ReceivedMessage) -> Result<Self, Self::Error> {
-        // decoded once: every `get_user_header` call would decode the whole map again
-        let headers = m.message.user_headers_map()?;
-        let header = |key: &HeaderKey| header_str(headers.as_ref(), key);
+/// decodes one back-topic message and hands it to its pending request or target connection
+fn handle_back_message(
+    pending: &DashMap<Arc<str>, PendingRequestEntry>,
+    connections: &DashMap<Uuid, ConnectionEntry>,
+    received: ReceivedMessage,
+) -> Result<(), AppError> {
+    // decoded once: every `get_user_header` call would decode the whole map again
+    let headers = received.message.user_headers_map()?;
+    let headers = headers.as_ref();
 
-        Ok(WsBackMessage {
-            signature: header(&header_keys::SIGNATURE),
-            service_error: header(&header_keys::SERVICE_ERROR).and_then(|v| v.parse().ok()),
-            service_status: header(&header_keys::SERVICE_STATUS).and_then(|v| v.parse().ok()),
-            target_connection_id: header(&header_keys::TARGET_WS_CONNECTION_ID).and_then(|v| Uuid::parse_str(&v).ok()),
-            payload: m.message.payload.to_vec(),
-        })
-    }
+    dispatch_back_message(
+        pending,
+        connections,
+        WsBackMessage {
+            signature: header(headers, &header_keys::SIGNATURE),
+            service_error: header(headers, &header_keys::SERVICE_ERROR).and_then(|v| v.parse().ok()),
+            service_status: header(headers, &header_keys::SERVICE_STATUS).and_then(|v| v.parse().ok()),
+            target_connection_id: header(headers, &header_keys::TARGET_WS_CONNECTION_ID).and_then(|v| Uuid::parse_str(v).ok()),
+            payload: received.message.payload,
+        },
+    );
+    Ok(())
 }
 
 impl WsGateState {
@@ -241,10 +255,11 @@ impl WsGateState {
                 info!("starting ws-gate back receiver thread {}", consumer_name);
                 while let Some(message) = iggy_consumer.next().await {
                     match message {
-                        Ok(received) => match WsBackMessage::try_from(received) {
-                            Ok(m) => dispatch_back_message(&pr, &conns, m),
-                            Err(e) => error!("error converting back message: {}", e),
-                        },
+                        Ok(received) => {
+                            if let Err(e) = handle_back_message(&pr, &conns, received) {
+                                error!("error converting back message: {}", e);
+                            }
+                        }
                         Err(e) => error!("Error while receiving message: {}", e),
                     }
                 }
@@ -302,7 +317,7 @@ fn dispatch_back_message(pending: &DashMap<Arc<str>, PendingRequestEntry>, conne
     // its final reply comes later with the same signature (or the watchdog times it out)
     if m.service_status.is_some()
         && let Some(sig) = &m.signature
-        && let Some(entry) = pending.get(sig.as_str())
+        && let Some(entry) = pending.get(*sig)
     {
         debug!(
             "ws provisional reply delivered: signature={} uri={} status={:?} elapsed={:?}",
@@ -323,7 +338,7 @@ fn dispatch_back_message(pending: &DashMap<Arc<str>, PendingRequestEntry>, conne
 
     // a final reply (or an error) ends the request
     if let Some(sig) = &m.signature
-        && let Some((signature, entry)) = pending.remove(sig.as_str())
+        && let Some((signature, entry)) = pending.remove(*sig)
     {
         debug!(
             "ws reply delivered: signature={} uri={} elapsed={:?}",

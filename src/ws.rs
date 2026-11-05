@@ -26,21 +26,25 @@ use ntex::{
     ws::{Frame, WsSink},
 };
 
-use skw_lib_shared::AppError;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::cfg::{CFG_CLIENT_TIMEOUT, CFG_HEARTBEAT_INTERVAL, CFG_MAX_INFLIGHT_FRAMES, CFG_MAX_PENDING_REQUESTS, CFG_MAX_SESSIONS_PER_TOKEN};
 use crate::crypto::{check_authorize, verify_signature};
 use crate::gate::{ConnectionEntry, PendingRequestEntry, PendingSlot, WsGateState, WsOutbound, publish_to_service};
 use crate::structs::{AuthState, WsMethod, WsRequest, WsState};
-use skw_lib_shared::prelude::{
-    axum::StatusCode,
-    chrono::Utc,
-    consts::BACK_MESSAGE_TIMEOUT,
-    iggy::SkwTopicType,
-    log::*,
-    tools::{skw_is_outdated, skw_random_signature},
-    uuid::Uuid,
+use skw_lib_shared::{
+    AppError,
+    prelude::{
+        axum::StatusCode,
+        chrono::Utc,
+        consts::BACK_MESSAGE_TIMEOUT,
+        iggy::SkwTopicType,
+        jsonrpc::SkwServiceHttpError,
+        log::*,
+        serde::{RawValue, Serialize},
+        tools::{skw_is_outdated, skw_random_signature},
+        uuid::Uuid,
+    },
 };
 
 /// Marks the client alive and passes `parsed` through: any client text frame proves it is
@@ -153,10 +157,7 @@ pub(crate) async fn handle_frame(
                                     );
 
                                     //@todo replace to Payload struct like in api gate
-                                    let reply = serde_json::json!({ "Authorized": true }).to_string();
-
-                                    // debug!("{:?}", state);
-                                    Some(Message::Text(reply.into()))
+                                    Some(Message::Text(r#"{"Authorized":true}"#.into()))
                                 }
                                 Err(_) => unauthorized_close(&outbound_tx),
                             },
@@ -462,21 +463,76 @@ pub(crate) async fn heartbeat(
     }
 }
 
+/// A reply to a request. `None` fields are written as `null`, like the former `json!` frames.
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct ReplyFrame<'a> {
+    signature: &'a str,
+    status: u16,
+    /// unit variants serialize as their name: the same text as `Display` ("NotFound", ...)
+    error_msg: Option<&'a SkwServiceHttpError>,
+    err_code: Option<u16>,
+    /// the service's JSON, passed through verbatim; invalid JSON becomes `null`
+    payload: Option<&'a RawValue>,
+}
+
+/// The gate's own error reply to a frame (`Uri` only on timeouts).
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct ErrorFrame<'a> {
+    signature: &'a str,
+    error_msg: &'a str,
+    err_code: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uri: Option<&'a str>,
+}
+
+/// An unsolicited push to a connection.
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct PushFrame<'a> {
+    push: bool,
+    payload: Option<&'a RawValue>,
+}
+
+/// `payload` as a borrowed JSON value; `None` (written as `null`) if it isn't valid JSON
+fn raw_json(payload: &[u8]) -> Option<&RawValue> {
+    serde_json::from_slice(payload).ok()
+}
+
+/// One text frame, written into a single buffer sized for the payload.
+fn text_frame<T: Serialize>(frame: &T, payload_len: usize) -> Message {
+    let mut buf = Vec::with_capacity(payload_len + 160);
+    if let Err(e) = serde_json::to_writer(&mut buf, frame) {
+        // can't happen: string keys only, no fallible Serialize impls
+        error!("serializing ws frame: {}", e);
+    }
+    // serde_json writes UTF-8 only, so this never falls back
+    Message::Text(String::from_utf8(buf).unwrap_or_default().into())
+}
+
 fn build_ws_message(outbound: WsOutbound) -> Message {
-    let json = match outbound {
-        WsOutbound::Close(reason) => return Message::Close(Some(reason)),
+    match outbound {
+        WsOutbound::Close(reason) => Message::Close(Some(reason)),
         WsOutbound::Error {
             signature,
             reason,
             code,
-        } => serde_json::json!({ "Signature": &*signature, "ErrorMsg": reason, "ErrCode": code.as_u16() }),
+        } => text_frame(
+            &ErrorFrame {
+                signature: &signature,
+                error_msg: reason,
+                err_code: code.as_u16(),
+                uri: None,
+            },
+            0,
+        ),
         WsOutbound::Reply {
             signature,
             payload,
             service_error,
             service_status,
         } => {
-            let payload: serde_json::Value = serde_json::from_slice(&payload).unwrap_or(serde_json::Value::Null);
             // HTTP status the api gate answers with: error code, 201/202 for a provisional reply
             // (request taken, its result comes later), else 200
             let status = service_error
@@ -485,28 +541,34 @@ fn build_ws_message(outbound: WsOutbound) -> Message {
                 .or(service_status.map(|s| s.status_code()))
                 .unwrap_or(StatusCode::OK);
 
-            serde_json::json!({
-                "Signature": &*signature,
-                "Status": status.as_u16(),
-                "ErrorMsg": service_error.as_ref().map(|e| e.to_string()),
-                "ErrCode": service_error.map(|e| e.status_code().as_u16()),
-                "Payload": payload,
-            })
+            text_frame(
+                &ReplyFrame {
+                    signature: &signature,
+                    status: status.as_u16(),
+                    error_msg: service_error.as_ref(),
+                    err_code: service_error.as_ref().map(|e| e.status_code().as_u16()),
+                    payload: raw_json(&payload),
+                },
+                payload.len(),
+            )
         }
-        WsOutbound::Push { payload } => {
-            let payload: serde_json::Value = serde_json::from_slice(&payload).unwrap_or(serde_json::Value::Null);
-            serde_json::json!({ "Push": true, "Payload": payload })
-        }
-        WsOutbound::Timeout { signature, uri } => {
-            serde_json::json!({
-                "Signature": &*signature,
-                "ErrorMsg": "Timeout",
-                "ErrCode": StatusCode::GATEWAY_TIMEOUT.as_u16(),
-                "Uri": uri,
-            })
-        }
-    };
-    Message::Text(json.to_string().into())
+        WsOutbound::Push { payload } => text_frame(
+            &PushFrame {
+                push: true,
+                payload: raw_json(&payload),
+            },
+            payload.len(),
+        ),
+        WsOutbound::Timeout { signature, uri } => text_frame(
+            &ErrorFrame {
+                signature: &signature,
+                error_msg: "Timeout",
+                err_code: StatusCode::GATEWAY_TIMEOUT.as_u16(),
+                uri: Some(&uri),
+            },
+            0,
+        ),
+    }
 }
 
 /// do websocket handshake and start web sockets service
@@ -558,10 +620,14 @@ pub(crate) fn close_connection(outbound_tx: &UnboundedSender<WsOutbound>, reason
 // request; the connection stays open for further requests.
 // `code` mirrors the HTTP status gates/api answers in the same situation.
 fn error_message(signature: &str, reason: &str, code: StatusCode) -> Option<Message> {
-    Some(Message::Text(
-        serde_json::json!({ "Signature": signature, "ErrorMsg": reason, "ErrCode": code.as_u16() })
-            .to_string()
-            .into(),
+    Some(text_frame(
+        &ErrorFrame {
+            signature,
+            error_msg: reason,
+            err_code: code.as_u16(),
+            uri: None,
+        },
+        0,
     ))
 }
 
@@ -623,7 +689,7 @@ mod tests {
     fn reply(service_error: Option<SkwServiceHttpError>, service_status: Option<SkwServiceStatus>) -> serde_json::Value {
         reply_json(WsOutbound::Reply {
             signature: "sig".into(),
-            payload: br#"{"Ping":{"Count":1}}"#.to_vec(),
+            payload: br#"{"Ping":{"Count":1}}"#.as_slice().into(),
             service_error,
             service_status,
         })
@@ -657,11 +723,82 @@ mod tests {
     fn invalid_payload_becomes_null() {
         let r = reply_json(WsOutbound::Reply {
             signature: "sig".into(),
-            payload: b"not json".to_vec(),
+            payload: b"not json".as_slice().into(),
             service_error: None,
             service_status: None,
         });
         assert!(r["Payload"].is_null());
+    }
+
+    fn frame_text(message: Message) -> String {
+        let Message::Text(text) = message else {
+            panic!("expected a text frame");
+        };
+        text.to_string()
+    }
+
+    /// the service's JSON goes out byte for byte (not re-serialized through a `Value`)
+    #[test]
+    fn reply_payload_is_passed_through_verbatim() {
+        let payload = r#"{ "Big": 123456789012345678901234567890, "F": 1.10 }"#;
+        let text = frame_text(build_ws_message(WsOutbound::Reply {
+            signature: "sig".into(),
+            payload: payload.as_bytes().into(),
+            service_error: None,
+            service_status: None,
+        }));
+        assert!(text.contains(payload), "{text}");
+    }
+
+    #[test]
+    fn push_frame() {
+        let r: serde_json::Value = serde_json::from_str(&frame_text(build_ws_message(WsOutbound::Push {
+            payload: br#"{"A":1}"#.as_slice().into(),
+        })))
+        .unwrap();
+        assert_eq!(
+            r,
+            serde_json::json!({ "Push": true, "Payload": { "A": 1 } })
+        );
+    }
+
+    /// same keys as the former `json!` frames: `Uri` only on timeouts, `null`s kept on replies
+    #[test]
+    fn frame_keys() {
+        let keys = |m: Message| {
+            let v: serde_json::Value = serde_json::from_str(&frame_text(m)).unwrap();
+            let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        };
+        assert_eq!(
+            keys(error_message("sig", "unknown service", StatusCode::BAD_REQUEST).unwrap()),
+            ["ErrCode", "ErrorMsg", "Signature"]
+        );
+        assert_eq!(
+            keys(build_ws_message(WsOutbound::Error {
+                signature: "sig".into(),
+                reason: "Too many sessions",
+                code: StatusCode::FORBIDDEN,
+            })),
+            ["ErrCode", "ErrorMsg", "Signature"]
+        );
+        assert_eq!(
+            keys(build_ws_message(WsOutbound::Timeout {
+                signature: "sig".into(),
+                uri: "/ping/signed".into(),
+            })),
+            ["ErrCode", "ErrorMsg", "Signature", "Uri"]
+        );
+        assert_eq!(
+            keys(build_ws_message(WsOutbound::Reply {
+                signature: "sig".into(),
+                payload: b"{}".as_slice().into(),
+                service_error: None,
+                service_status: None,
+            })),
+            ["ErrCode", "ErrorMsg", "Payload", "Signature", "Status"]
+        );
     }
 
     #[test]

@@ -3,7 +3,12 @@ use std::sync::{Arc, atomic::AtomicUsize};
 use std::time::Instant;
 
 use crate::gate::SessionSlot;
-use skw_lib_shared::prelude::{jsonrpc::JsonRpcGateHttpRequest, serde::*, uuid::Uuid};
+use ed25519_dalek::VerifyingKey;
+use skw_lib_shared::prelude::{
+    chrono::{DateTime, Utc},
+    serde::*,
+    uuid::Uuid,
+};
 
 /// A parsed value paired with the exact raw JSON text it came from. One
 /// `Deserialize` pass gives both typed field access (via `Deref`) and the
@@ -57,13 +62,21 @@ impl<T> Serialize for Signed<T> {
     }
 }
 
+/// The only field of `Data` the gate reads. `Method`/`Params` go to the service as the raw
+/// signed text, so they are skipped, not parsed (hence no `deny_unknown_fields` here).
+#[derive(Debug, Deserialize)]
+pub(crate) struct DataTs {
+    #[serde(rename = "Ts")]
+    pub ts: DateTime<Utc>,
+}
+
 /// Client frame: `{"Signature", "Uri", "Data"}`.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "PascalCase")]
 pub(crate) struct WsRequest {
     pub signature: String,
     pub uri: Option<String>,
-    pub data: Signed<JsonRpcGateHttpRequest>,
+    pub data: Signed<DataTs>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,7 +100,8 @@ pub(crate) struct WsState {
     /// since public/open requests need no authorization.
     pub hb: Instant,
     pub auth: AuthState,
-    pub public_key: Option<String>,
+    /// parsed once on Authorize, so signed frames don't decode the key again
+    pub public_key: Option<VerifyingKey>,
     /// set together with public_key on successful Authorize; forwarded as
     /// IGGY_HEADER_API_KEY on every request published for this connection
     pub api_key: Option<Uuid>,
@@ -126,7 +140,10 @@ mod tests {
         let req: WsRequest = serde_json::from_str(&frame).unwrap();
 
         assert_eq!(req.data.raw_str(), data);
-        assert_eq!(req.data.method["Method"], "Ping");
+        assert_eq!(
+            req.data.ts,
+            "2026-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
         assert_eq!(req.uri.as_deref(), Some("/ping/signed"));
     }
 
@@ -160,6 +177,14 @@ mod tests {
         }))
         .unwrap();
         let WsMethod::Authorize { api_key } = m;
+        assert_eq!(api_key.to_string(), "01a01500-98d5-71fc-9038-71acb78d61c4");
+    }
+
+    /// `Authorize` is read straight from the raw `Data` text: the extra `Ts` key is skipped
+    #[test]
+    fn authorize_method_parses_from_raw_data() {
+        let raw = r#"{"Ts":"2026-01-01T00:00:00Z","Method":"Authorize","Params":{"ApiKey":"01a01500-98d5-71fc-9038-71acb78d61c4"}}"#;
+        let WsMethod::Authorize { api_key } = serde_json::from_str(raw).unwrap();
         assert_eq!(api_key.to_string(), "01a01500-98d5-71fc-9038-71acb78d61c4");
     }
 }

@@ -31,7 +31,6 @@ pub(crate) const CFG_BACK_TOPIC_PART_COUNT: &str = "/service/backTopicPartitions
 /// pause between attempts to rebuild the back-topic consumer after its stream ended
 const BACK_CONSUMER_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
 
-#[derive(Clone)]
 pub(crate) struct RoutesMap {
     pub map: HashMap<String, Arc<IggyProducer>>,
 }
@@ -164,7 +163,7 @@ pub(crate) struct ConnectionEntry {
 
 #[derive(Clone)]
 pub(crate) struct WsGateState {
-    pub routes_map: RoutesMap,
+    pub routes_map: Arc<RoutesMap>,
     pub pending_requests: Arc<DashMap<String, PendingRequestEntry>>,
     pub connections: Arc<DashMap<Uuid, ConnectionEntry>>,
     pub sessions: Sessions,
@@ -262,7 +261,7 @@ impl WsGateState {
         });
 
         Ok(Self {
-            routes_map,
+            routes_map: Arc::new(routes_map),
             pending_requests,
             connections,
             sessions: Sessions::default(),

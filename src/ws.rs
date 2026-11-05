@@ -114,7 +114,7 @@ pub(crate) async fn handle_frame(
                         // to be dispatched concurrently.
                         state.borrow_mut().auth = AuthState::Authorizing;
 
-                        match serde_json::from_value::<WsMethod>(req.data.method.clone()) {
+                        match serde_json::from_str::<WsMethod>(req.data.raw_str()) {
                             Ok(WsMethod::Authorize { api_key }) => match check_authorize(api_key, &req.signature, req.data.raw_str()).await {
                                 // an old Authorize frame must not open a session: it fails like bad credentials
                                 Ok(_) if skw_is_outdated(req.data.ts) => {
@@ -173,16 +173,12 @@ pub(crate) async fn handle_frame(
                         }
                     }
                     AuthState::Authorized => {
-                        // set together with AuthState::Authorized, so always present here
-                        let (public_key, api_key) = {
+                        // set together with AuthState::Authorized; refuse rather than panic if that ever breaks
+                        let (Some(public_key), api_key) = ({
                             let state = state.borrow();
-                            (
-                                state
-                                    .public_key
-                                    .clone()
-                                    .expect("public_key set once Authorized"),
-                                state.api_key,
-                            )
+                            (state.public_key, state.api_key)
+                        }) else {
+                            return Ok(unauthorized_close(&outbound_tx));
                         };
 
                         match verify_signature(&public_key, &req.signature, req.data.raw_str()) {

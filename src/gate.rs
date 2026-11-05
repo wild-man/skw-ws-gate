@@ -43,13 +43,13 @@ pub(crate) struct RoutesMap {
 pub(crate) enum WsOutbound {
     Reply {
         signature: String,
-        payload: Bytes,
+        payload: Vec<u8>,
         service_error: Option<SkwServiceHttpError>,
         /// Some = provisional reply (Created/Accepted): request taken, its result comes later
         service_status: Option<SkwServiceStatus>,
     },
     Push {
-        payload: Bytes,
+        payload: Vec<u8>,
     },
     Timeout {
         signature: String,
@@ -164,8 +164,7 @@ pub(crate) struct ConnectionEntry {
 
 #[derive(Clone)]
 pub(crate) struct WsGateState {
-    /// shared: `WsGateState` is cloned for every frame, so the table itself must not be
-    pub routes_map: Arc<RoutesMap>,
+    pub routes_map: RoutesMap,
     pub pending_requests: Arc<DashMap<String, PendingRequestEntry>>,
     pub connections: Arc<DashMap<Uuid, ConnectionEntry>>,
     pub sessions: Sessions,
@@ -177,8 +176,7 @@ pub(crate) struct WsGateState {
 /// no backend service produces this header yet)
 #[derive(Debug, Clone)]
 struct WsBackMessage {
-    /// shares the received message's buffer, no copy
-    payload: Bytes,
+    payload: Vec<u8>,
     signature: Option<String>,
     service_error: Option<SkwServiceHttpError>,
     service_status: Option<SkwServiceStatus>,
@@ -191,21 +189,14 @@ impl TryFrom<ReceivedMessage> for WsBackMessage {
     fn try_from(m: ReceivedMessage) -> Result<Self, Self::Error> {
         // decoded once: every `get_user_header` call would decode the whole map again
         let headers = m.message.user_headers_map()?;
-        // borrowed: only the signature is kept, the other headers are parsed in place. Every
-        // gate-bound header is written as a string (`HeaderValue::from_str`), other kinds are ignored
-        let header = |key: &HeaderKey| {
-            headers
-                .as_ref()
-                .and_then(|h| h.get(key))
-                .and_then(|v| v.as_str().ok())
-        };
+        let header = |key: &HeaderKey| header_str(headers.as_ref(), key);
 
         Ok(WsBackMessage {
-            signature: header(&header_keys::SIGNATURE).map(str::to_owned),
+            signature: header(&header_keys::SIGNATURE),
             service_error: header(&header_keys::SERVICE_ERROR).and_then(|v| v.parse().ok()),
             service_status: header(&header_keys::SERVICE_STATUS).and_then(|v| v.parse().ok()),
-            target_connection_id: header(&header_keys::TARGET_WS_CONNECTION_ID).and_then(|v| Uuid::parse_str(v).ok()),
-            payload: m.message.payload,
+            target_connection_id: header(&header_keys::TARGET_WS_CONNECTION_ID).and_then(|v| Uuid::parse_str(&v).ok()),
+            payload: m.message.payload.to_vec(),
         })
     }
 }
@@ -271,7 +262,7 @@ impl WsGateState {
         });
 
         Ok(Self {
-            routes_map: Arc::new(routes_map),
+            routes_map,
             pending_requests,
             connections,
             sessions: Sessions::default(),
